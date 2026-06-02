@@ -29,6 +29,16 @@ let groupParticipants = [];
 let currentSessionState = null;
 let cronjobs = [];
 
+// ============================================
+// Retry Configuration
+// ============================================
+const RETRY_CONFIG = {
+  maxRetries: 5,
+  retryDelay: 3000, // 3 seconds between retries
+};
+
+let connectionAttempts = 0;
+
 function loadState() {
   if (fs.existsSync(CONFIG.DATA_FILE)) {
     try {
@@ -429,7 +439,17 @@ async function connectToWhatsApp() {
     authStrategy: new LocalAuth(),
     puppeteer: {
       headless: true,
-      args: ['--no-sandbox', '--disable-setuid-sandbox'],
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--no-first-run',
+        '--no-default-browser-check',
+        '--disable-default-apps',
+        '--disable-extensions',
+        '--disable-sync'
+      ],
     },
   });
 
@@ -462,8 +482,19 @@ async function connectToWhatsApp() {
   try {
     await client.initialize();
   } catch (err) {
-    console.error('Fatal error during initialization:', err.message);
-    process.exit(1);
+    connectionAttempts++;
+    console.error(`\n❌ Error during initialization (attempt ${connectionAttempts}/${RETRY_CONFIG.maxRetries}):`, err.message);
+    
+    if (connectionAttempts < RETRY_CONFIG.maxRetries) {
+      console.log(`⏳ Retrying in ${RETRY_CONFIG.retryDelay/1000} seconds...\n`);
+      setTimeout(() => {
+        connectionAttempts = 0;
+        connectToWhatsApp();
+      }, RETRY_CONFIG.retryDelay);
+    } else {
+      console.error('❌ Max connection attempts reached. Exiting.');
+      process.exit(1);
+    }
   }
 }
 
