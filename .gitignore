@@ -1,0 +1,8 @@
+node_modules/
+.wwebjs_auth/
+.wwebjs_cache/
+punch_data.json
+.DS_Store
+*.log
+.env
+.env.local
