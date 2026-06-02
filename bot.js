@@ -435,22 +435,38 @@ async function connectToWhatsApp() {
   console.log(`  Follow-up Delay: ${CONFIG.FOLLOWUP_DELAY_MINUTES} minutes`);
   console.log(`  Skip Sundays: ${CONFIG.SUNDAY_OFF}\n`);
 
+  const puppeteerConfig = {
+    headless: true,
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-gpu',
+      '--no-first-run',
+      '--no-default-browser-check',
+      '--disable-default-apps',
+      '--disable-extensions',
+      '--disable-sync'
+    ],
+  };
+
+  const chromiumPaths = [
+    '/usr/bin/chromium-browser',
+    '/usr/bin/chromium',
+    '/usr/bin/google-chrome',
+    '/usr/bin/google-chrome-stable',
+  ];
+  for (const p of chromiumPaths) {
+    if (fs.existsSync(p)) {
+      puppeteerConfig.executablePath = p;
+      console.log(`Using Chromium at: ${p}`);
+      break;
+    }
+  }
+
   client = new Client({
     authStrategy: new LocalAuth(),
-    puppeteer: {
-      headless: true,
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-gpu',
-        '--no-first-run',
-        '--no-default-browser-check',
-        '--disable-default-apps',
-        '--disable-extensions',
-        '--disable-sync'
-      ],
-    },
+    puppeteer: puppeteerConfig,
   });
 
   client.on('qr', (qr) => {
