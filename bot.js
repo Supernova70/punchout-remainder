@@ -471,6 +471,14 @@ async function connectToWhatsApp() {
     console.error('❌ Authentication failed:', msg);
   });
 
+  client.on('change_state', (state) => {
+    console.log('🔄 State Changed:', state);
+  });
+
+  client.on('loading_screen', (percent, message) => {
+    console.log(`⏳ Loading Screen: ${percent}% - ${message}`);
+  });
+
   client.on('ready', async () => {
     console.log('\n✓ Connected to WhatsApp!');
     console.log('⏳ Loading chats...\n');
