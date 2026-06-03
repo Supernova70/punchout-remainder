@@ -450,20 +450,6 @@ async function connectToWhatsApp() {
     ],
   };
 
-  const chromiumPaths = [
-    '/usr/bin/chromium-browser',
-    '/usr/bin/chromium',
-    '/usr/bin/google-chrome',
-    '/usr/bin/google-chrome-stable',
-  ];
-  for (const p of chromiumPaths) {
-    if (fs.existsSync(p)) {
-      puppeteerConfig.executablePath = p;
-      console.log(`Using Chromium at: ${p}`);
-      break;
-    }
-  }
-
   client = new Client({
     authStrategy: new LocalAuth(),
     puppeteer: puppeteerConfig,
