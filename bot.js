@@ -10,13 +10,20 @@ const { Client, LocalAuth } = require('whatsapp-web.js');
 const CONFIG = {
   GROUP_NAME: 'CL Chat',
   TIMEZONE: 'Asia/Kolkata',
-  PUNCH_IN_HOUR: 9,
-  PUNCH_IN_MINUTE: 0,
-  PUNCH_OUT_HOUR: 17,
-  PUNCH_OUT_MINUTE: 0,
-  FOLLOWUP_DELAY_MINUTES: 30,
   SUNDAY_OFF: true,
   DATA_FILE: './punch_data.json',
+  PUNCH_STATUS_FILE: 'C:/Users/Dragon/Desktop/projects/punchin-auto/status/punch_status.json',
+  PUNCH_CONFIG_FILE: 'C:/Users/Dragon/Desktop/projects/punchin-auto/config.json',
+  // Auto punch check times (after punch_action.py runs)
+  PUNCH_IN_CHECK_MINUTE: 5,
+  PUNCH_IN_CHECK_HOUR: 9,
+  PUNCH_OUT_CHECK_MINUTE: 35,
+  PUNCH_OUT_CHECK_HOUR: 17,
+  // Follow-up times (for manual users who didn't !done)
+  PUNCH_IN_FOLLOWUP_MINUTE: 40,
+  PUNCH_IN_FOLLOWUP_HOUR: 9,
+  PUNCH_OUT_FOLLOWUP_MINUTE: 10,
+  PUNCH_OUT_FOLLOWUP_HOUR: 18,
 };
 
 // ============================================
@@ -26,6 +33,8 @@ const CONFIG = {
 let client = null;
 let groupId = null;
 let groupParticipants = [];
+let autoPunchUsers = []; // Users with auto-punch configured
+let manualUsers = []; // Users who need to punch manually
 let currentSessionState = null;
 let cronjobs = [];
 
@@ -105,6 +114,42 @@ function extractNumberFromId(id) {
 }
 
 // ============================================
+// Load Auto-Punch Users from Config
+// ============================================
+
+function loadAutoPunchUsers() {
+  try {
+    if (fs.existsSync(CONFIG.PUNCH_CONFIG_FILE)) {
+      const config = JSON.parse(fs.readFileSync(CONFIG.PUNCH_CONFIG_FILE, 'utf-8'));
+      autoPunchUsers = (config.users || []).map(u => ({
+        name: u.name,
+        whatsapp: u.whatsapp
+      }));
+      console.log(`✓ Loaded ${autoPunchUsers.length} auto-punch users from config:`);
+      autoPunchUsers.forEach(u => console.log(`  • ${u.name} (${u.whatsapp})`));
+    }
+  } catch (err) {
+    console.error('Error loading punch config:', err.message);
+  }
+}
+
+function categorizeParticipants() {
+  const autoPunchNumbers = autoPunchUsers.map(u => u.whatsapp);
+  
+  manualUsers = groupParticipants
+    .filter(id => !autoPunchNumbers.includes(extractNumberFromId(id)))
+    .map(id => ({
+      id,
+      number: extractNumberFromId(id)
+    }));
+
+  console.log(`\n✓ Categorized participants:`);
+  console.log(`  Auto-punch: ${autoPunchUsers.length} users`);
+  console.log(`  Manual (need reminder): ${manualUsers.length} users`);
+  manualUsers.forEach(u => console.log(`  • ${u.number}`));
+}
+
+// ============================================
 // WhatsApp Message Helpers
 // ============================================
 
@@ -131,60 +176,51 @@ function setupCronJobs() {
   cronjobs.forEach((job) => job.stop());
   cronjobs = [];
 
-  // Punch-in reminder
-  const punchInJob = cron.schedule(
-    `${CONFIG.PUNCH_IN_MINUTE} ${CONFIG.PUNCH_IN_HOUR} * * *`,
+  // ===== PUNCH IN FLOW =====
+
+  // 9:05 AM - Check auto-punch IN results + tag manual users
+  const punchInCheckJob = cron.schedule(
+    `${CONFIG.PUNCH_IN_CHECK_MINUTE} ${CONFIG.PUNCH_IN_CHECK_HOUR} * * *`,
     async () => {
-      if (isSunday() && CONFIG.SUNDAY_OFF) {
-        console.log(`[${CONFIG.PUNCH_IN_HOUR}:${String(CONFIG.PUNCH_IN_MINUTE).padStart(2, '0')}] Sunday - Skipping punch-in reminder`);
-        return;
-      }
-      console.log(`[${CONFIG.PUNCH_IN_HOUR}:${String(CONFIG.PUNCH_IN_MINUTE).padStart(2, '0')}] Sending punch-in reminder`);
-      if (!groupId || !client) {
-        console.log('Group not found or client disconnected');
-        return;
-      }
+      if (isSunday() && CONFIG.SUNDAY_OFF) return;
+      console.log(`[9:05 AM] Checking punch-in status...`);
+      if (!groupId || !client) return;
 
       initializeSessionState('morning');
 
-      const mentionText = groupParticipants
-        .map((id) => `@${extractNumberFromId(id)}`)
-        .join(' ');
+      // Read the punch status file
+      const statusData = readPunchStatus();
+      if (statusData && statusData.action === 'in') {
+        // Send auto-punch report
+        await sendPunchReport(statusData);
+      }
 
-      const text = `⏰ Punch In Time! Guys, please punch in for the day. Reply with !done once you have punched in.\n\n${mentionText}`;
-
-      const mentions = groupParticipants.map((id) => id);
-      await sendMessage(groupId, text, mentions);
+      // Send reminder to manual users
+      await sendManualReminder('in');
     },
     { timezone: CONFIG.TIMEZONE }
   );
-  cronjobs.push(punchInJob);
+  cronjobs.push(punchInCheckJob);
 
-  // Punch-in follow-up
-  const followUpMinute = (CONFIG.PUNCH_IN_MINUTE + CONFIG.FOLLOWUP_DELAY_MINUTES) % 60;
-  const followUpHour = CONFIG.PUNCH_IN_HOUR + Math.floor((CONFIG.PUNCH_IN_MINUTE + CONFIG.FOLLOWUP_DELAY_MINUTES) / 60);
-
+  // 9:40 AM - Follow-up for manual users who didn't !done
   const punchInFollowupJob = cron.schedule(
-    `${followUpMinute} ${followUpHour} * * *`,
+    `${CONFIG.PUNCH_IN_FOLLOWUP_MINUTE} ${CONFIG.PUNCH_IN_FOLLOWUP_HOUR} * * *`,
     async () => {
       if (isSunday() && CONFIG.SUNDAY_OFF) return;
-      console.log(`[Follow-up] Checking for punch-in follow-up`);
-      if (!groupId || !client || !currentSessionState || currentSessionState.currentSession !== 'morning') return;
+      console.log(`[9:40 AM] Sending punch-in follow-up...`);
+      if (!groupId || !client || !currentSessionState) return;
 
       const pending = getPendingParticipants();
       if (pending.length === 0) {
-        console.log(`[Follow-up] Everyone has punched in, no follow-up needed`);
-        currentSessionState.followUpSent = true;
-        saveState(currentSessionState);
+        console.log(`[Follow-up] Everyone done, no follow-up needed`);
         return;
       }
 
       const pendingMentions = pending.map((p) => `@${p.name}`).join(' ');
-      const pendingNames = pending.map((p) => p.name).join(', ');
-
-      const text = `⏰ Gentle Reminder: The following people still need to punch in: ${pendingNames}. Please punch in and reply !done.\n\n${pendingMentions}`;
-
       const mentions = pending.map((p) => p.id);
+
+      const text = `⏰ *Reminder:* These people still need to punch in:\n\n${pendingMentions}\n\nPlease punch in and reply !done`;
+
       await sendMessage(groupId, text, mentions);
       currentSessionState.followUpSent = true;
       saveState(currentSessionState);
@@ -193,60 +229,51 @@ function setupCronJobs() {
   );
   cronjobs.push(punchInFollowupJob);
 
-  // Punch-out reminder
-  const punchOutJob = cron.schedule(
-    `${CONFIG.PUNCH_OUT_MINUTE} ${CONFIG.PUNCH_OUT_HOUR} * * *`,
+  // ===== PUNCH OUT FLOW =====
+
+  // 5:35 PM - Check auto-punch OUT results + tag manual users
+  const punchOutCheckJob = cron.schedule(
+    `${CONFIG.PUNCH_OUT_CHECK_MINUTE} ${CONFIG.PUNCH_OUT_CHECK_HOUR} * * *`,
     async () => {
-      if (isSunday() && CONFIG.SUNDAY_OFF) {
-        console.log(`[${CONFIG.PUNCH_OUT_HOUR}:${String(CONFIG.PUNCH_OUT_MINUTE).padStart(2, '0')}] Sunday - Skipping punch-out reminder`);
-        return;
-      }
-      console.log(`[${CONFIG.PUNCH_OUT_HOUR}:${String(CONFIG.PUNCH_OUT_MINUTE).padStart(2, '0')}] Sending punch-out reminder`);
-      if (!groupId || !client) {
-        console.log('Group not found or client disconnected');
-        return;
-      }
+      if (isSunday() && CONFIG.SUNDAY_OFF) return;
+      console.log(`[5:35 PM] Checking punch-out status...`);
+      if (!groupId || !client) return;
 
       initializeSessionState('evening');
 
-      const mentionText = groupParticipants
-        .map((id) => `@${extractNumberFromId(id)}`)
-        .join(' ');
+      // Read the punch status file
+      const statusData = readPunchStatus();
+      if (statusData && statusData.action === 'out') {
+        // Send auto-punch report
+        await sendPunchReport(statusData);
+      }
 
-      const text = `🏁 Punch Out Time! Guys, please punch out for the day. Reply with !done once you have punched out.\n\n${mentionText}`;
-
-      const mentions = groupParticipants.map((id) => id);
-      await sendMessage(groupId, text, mentions);
+      // Send reminder to manual users
+      await sendManualReminder('out');
     },
     { timezone: CONFIG.TIMEZONE }
   );
-  cronjobs.push(punchOutJob);
+  cronjobs.push(punchOutCheckJob);
 
-  // Punch-out follow-up
-  const followOutMinute = (CONFIG.PUNCH_OUT_MINUTE + CONFIG.FOLLOWUP_DELAY_MINUTES) % 60;
-  const followOutHour = CONFIG.PUNCH_OUT_HOUR + Math.floor((CONFIG.PUNCH_OUT_MINUTE + CONFIG.FOLLOWUP_DELAY_MINUTES) / 60);
-
+  // 6:10 PM - Follow-up for manual users who didn't !done
   const punchOutFollowupJob = cron.schedule(
-    `${followOutMinute} ${followOutHour} * * *`,
+    `${CONFIG.PUNCH_OUT_FOLLOWUP_MINUTE} ${CONFIG.PUNCH_OUT_FOLLOWUP_HOUR} * * *`,
     async () => {
       if (isSunday() && CONFIG.SUNDAY_OFF) return;
-      console.log(`[Follow-up] Checking for punch-out follow-up`);
-      if (!groupId || !client || !currentSessionState || currentSessionState.currentSession !== 'evening') return;
+      console.log(`[6:10 PM] Sending punch-out follow-up...`);
+      if (!groupId || !client || !currentSessionState) return;
 
       const pending = getPendingParticipants();
       if (pending.length === 0) {
-        console.log(`[Follow-up] Everyone has punched out, no follow-up needed`);
-        currentSessionState.followUpSent = true;
-        saveState(currentSessionState);
+        console.log(`[Follow-up] Everyone done, no follow-up needed`);
         return;
       }
 
       const pendingMentions = pending.map((p) => `@${p.name}`).join(' ');
-      const pendingNames = pending.map((p) => p.name).join(', ');
-
-      const text = `⏰ Gentle Reminder: The following people still need to punch out: ${pendingNames}. Please punch out and reply !done.\n\n${pendingMentions}`;
-
       const mentions = pending.map((p) => p.id);
+
+      const text = `⏰ *Reminder:* These people still need to punch out:\n\n${pendingMentions}\n\nPlease punch out and reply !done`;
+
       await sendMessage(groupId, text, mentions);
       currentSessionState.followUpSent = true;
       saveState(currentSessionState);
@@ -261,10 +288,7 @@ function setupCronJobs() {
     async () => {
       if (isSunday() && CONFIG.SUNDAY_OFF) return;
       console.log(`[3:00 PM] Sending motivational message`);
-      if (!groupId || !client) {
-        console.log('Group not found or client disconnected');
-        return;
-      }
+      if (!groupId || !client) return;
 
       const mentionText = groupParticipants
         .map((id) => `@${extractNumberFromId(id)}`)
@@ -279,7 +303,115 @@ function setupCronJobs() {
   );
   cronjobs.push(motivationalJob);
 
-  console.log('✓ Cron jobs scheduled successfully\n');
+  console.log('✓ Cron jobs scheduled:');
+  console.log('  9:05 AM  - Check punch-in + tag manual users');
+  console.log('  9:40 AM  - Follow-up for punch-in');
+  console.log('  5:35 PM  - Check punch-out + tag manual users');
+  console.log('  6:10 PM  - Follow-up for punch-out');
+  console.log('  3:00 PM  - Motivational message\n');
+}
+
+// ============================================
+// Punch Status Helpers
+// ============================================
+
+function readPunchStatus() {
+  try {
+    if (fs.existsSync(CONFIG.PUNCH_STATUS_FILE)) {
+      const data = JSON.parse(fs.readFileSync(CONFIG.PUNCH_STATUS_FILE, 'utf-8'));
+      return data;
+    }
+  } catch (err) {
+    console.error('Error reading punch status:', err.message);
+  }
+  return null;
+}
+
+async function sendPunchReport(data) {
+  const action = data.action.toUpperCase();
+  const results = data.results || [];
+
+  const successUsers = results.filter(r => r.status === 'SUCCESS');
+  const alreadyDoneUsers = results.filter(r => r.status === 'ALREADY_DONE');
+  const failedUsers = results.filter(r => !['SUCCESS', 'ALREADY_DONE'].includes(r.status));
+
+  let message = `*Auto Punch ${action} Report*\n`;
+  message += `Time: ${new Date().toLocaleString('en-IN', { timeZone: CONFIG.TIMEZONE })}\n\n`;
+
+  if (successUsers.length > 0) {
+    message += `✅ *Successful (${successUsers.length}):*\n`;
+    successUsers.forEach(u => {
+      message += `  • ${u.name}`;
+      if (u.coordinates) message += ` (${u.coordinates})`;
+      message += '\n';
+    });
+    message += '\n';
+  }
+
+  if (alreadyDoneUsers.length > 0) {
+    message += `⏭️ *Already Done (${alreadyDoneUsers.length}):*\n`;
+    alreadyDoneUsers.forEach(u => {
+      message += `  • ${u.name}\n`;
+    });
+    message += '\n';
+  }
+
+  if (failedUsers.length > 0) {
+    message += `❌ *Failed (${failedUsers.length}):*\n`;
+    failedUsers.forEach(u => {
+      message += `  • ${u.name} - ${u.status}`;
+      if (u.reason) message += ` (${u.reason})`;
+      message += '\n';
+    });
+    message += '\n';
+  }
+
+  const totalProcessed = successUsers.length + alreadyDoneUsers.length;
+  message += `_Total: ${totalProcessed}/${results.length} completed_`;
+
+  try {
+    await client.sendMessage(groupId, message);
+    console.log(`✓ Punch ${action} report sent to group`);
+  } catch (err) {
+    console.error('Error sending punch report:', err.message);
+  }
+
+  // Send DM to each successfully auto-punched user
+  for (const result of results) {
+    if (result.whatsapp && result.status === 'SUCCESS') {
+      const userJid = `${result.whatsapp}@s.whatsapp.net`;
+      const userMsg = `Hi ${result.name}! ✅ Your punch ${action} was successful.\nTime: ${new Date().toLocaleString('en-IN', { timeZone: CONFIG.TIMEZONE })}`;
+      try {
+        await client.sendMessage(userJid, userMsg);
+        console.log(`✓ DM sent to ${result.name}`);
+      } catch (err) {
+        console.error(`Error sending DM to ${result.name}:`, err.message);
+      }
+    }
+  }
+}
+
+async function sendManualReminder(action) {
+  if (manualUsers.length === 0) {
+    console.log('No manual users to remind');
+    return;
+  }
+
+  const manualMentions = manualUsers.map(u => `@${u.number}`).join(' ');
+  const mentions = manualUsers.map(u => u.id);
+
+  const actionText = action === 'in' ? 'punch in' : 'punch out';
+  let text = `⏰ *Punch ${action.toUpperCase()} Time!*\n\n`;
+  text += `Auto-punch users: Done ✅\n\n`;
+  text += `Manual users, please ${actionText} now:\n${manualMentions}\n\n`;
+  text += `Reply !done after you ${actionText}`;
+
+  try {
+    await client.sendMessage(groupId, text, { mentions });
+    console.log(`✓ Manual ${action} reminder sent (tagged ${manualUsers.length} users)`);
+  } catch (err) {
+    console.error('Error sending manual reminder:', err.message);
+  }
 }
 
 // ============================================
@@ -318,6 +450,10 @@ async function findAndCacheGroup() {
     groupParticipants.forEach((id) => {
       console.log(`  • ${extractNumberFromId(id)}`);
     });
+
+    // Load auto-punch users and categorize
+    loadAutoPunchUsers();
+    categorizeParticipants();
 
     const savedState = loadState();
     if (savedState) {
@@ -430,10 +566,9 @@ async function connectToWhatsApp() {
   console.log(`Configuration:`);
   console.log(`  Group Name: ${CONFIG.GROUP_NAME}`);
   console.log(`  Timezone: ${CONFIG.TIMEZONE}`);
-  console.log(`  Punch In: ${CONFIG.PUNCH_IN_HOUR}:${String(CONFIG.PUNCH_IN_MINUTE).padStart(2, '0')}`);
-  console.log(`  Punch Out: ${CONFIG.PUNCH_OUT_HOUR}:${String(CONFIG.PUNCH_OUT_MINUTE).padStart(2, '0')}`);
-  console.log(`  Follow-up Delay: ${CONFIG.FOLLOWUP_DELAY_MINUTES} minutes`);
-  console.log(`  Skip Sundays: ${CONFIG.SUNDAY_OFF}\n`);
+  console.log(`  Skip Sundays: ${CONFIG.SUNDAY_OFF}`);
+  console.log(`  Punch Status File: ${CONFIG.PUNCH_STATUS_FILE}`);
+  console.log(`  Punch Config File: ${CONFIG.PUNCH_CONFIG_FILE}\n`);
 
   const puppeteerConfig = {
     headless: true,
