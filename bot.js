@@ -12,8 +12,8 @@ const CONFIG = {
   TIMEZONE: 'Asia/Kolkata',
   SUNDAY_OFF: true,
   DATA_FILE: './punch_data.json',
-  PUNCH_STATUS_FILE: 'C:/Users/Dragon/Desktop/projects/punchin-auto/status/punch_status.json',
-  PUNCH_CONFIG_FILE: 'C:/Users/Dragon/Desktop/projects/punchin-auto/config.json',
+  PUNCH_STATUS_FILE: '/home/ubuntu/punchin-auto/status/punch_status.json',
+  PUNCH_CONFIG_FILE: '/home/ubuntu/punchin-auto/config.json',
   // Auto punch check times (after punch_action.py runs)
   PUNCH_IN_CHECK_MINUTE: 5,
   PUNCH_IN_CHECK_HOUR: 9,
