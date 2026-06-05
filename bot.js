@@ -14,10 +14,16 @@ const CONFIG = {
   DATA_FILE: './punch_data.json',
   PUNCH_STATUS_FILE: '/home/ubuntu/punchin-auto/status/punch_status.json',
   PUNCH_CONFIG_FILE: '/home/ubuntu/punchin-auto/config.json',
+  // Stale lock file path (Chromium leaves this behind on crash)
+  WWEBJS_SESSION_DIR: '/home/ubuntu/punchout-remainder/.wwebjs_auth/session',
   // Auto punch check times (after punch_action.py runs)
-  PUNCH_IN_CHECK_MINUTE: 5,
+  // NOTE: punch_action.py runs sequentially per user (new browser per user).
+  // With 4 users × ~2-5 min each = up to 20 min total.
+  // Cron fires at 9:00 AM and 9:30 AM; bot checks at 9:15 AM and 9:45 AM
+  // to ensure the Python script has finished before the report is sent.
+  PUNCH_IN_CHECK_MINUTE: 15,   // was 5  → now 15 to allow 15 min for 4 users
   PUNCH_IN_CHECK_HOUR: 9,
-  PUNCH_OUT_CHECK_MINUTE: 35,
+  PUNCH_OUT_CHECK_MINUTE: 45,  // was 35 → now 45 (same reason for punch-out)
   PUNCH_OUT_CHECK_HOUR: 17,
   // Follow-up times (for manual users who didn't !done)
   PUNCH_IN_FOLLOWUP_MINUTE: 40,
@@ -37,6 +43,7 @@ let autoPunchUsers = []; // Users with auto-punch configured
 let manualUsers = []; // Users who need to punch manually
 let currentSessionState = null;
 let cronjobs = [];
+const startTime = Date.now(); // Track bot uptime for !status
 
 // ============================================
 // Retry Configuration
@@ -51,11 +58,46 @@ let loadingTimeout = null;
 let lastLoadingPercent = 0;
 let loadingStuckSince = null;
 
+// ============================================
+// Problem 1 Fix: Stale Chromium lock file cleanup
+// ============================================
+
+function cleanStaleLockFiles() {
+  const lockFiles = [
+    path.join(CONFIG.WWEBJS_SESSION_DIR, 'SingletonLock'),
+    path.join(CONFIG.WWEBJS_SESSION_DIR, 'SingletonCookie'),
+    path.join(CONFIG.WWEBJS_SESSION_DIR, 'SingletonSocket'),
+  ];
+
+  let cleaned = 0;
+  for (const lockPath of lockFiles) {
+    try {
+      if (fs.existsSync(lockPath)) {
+        fs.rmSync(lockPath, { force: true });
+        console.log(`🧹 Removed stale lock file: ${path.basename(lockPath)}`);
+        cleaned++;
+      }
+    } catch (err) {
+      console.error(`⚠️ Could not remove ${path.basename(lockPath)}: ${err.message}`);
+    }
+  }
+  if (cleaned === 0) {
+    console.log('✓ No stale lock files found');
+  }
+}
+
+// ============================================
+// State File Helpers
+// ============================================
+
 function loadState() {
   if (fs.existsSync(CONFIG.DATA_FILE)) {
     try {
       const data = fs.readFileSync(CONFIG.DATA_FILE, 'utf-8');
-      return JSON.parse(data);
+      const parsed = JSON.parse(data);
+      // Problem 5 Fix: handle null/empty state gracefully
+      if (!parsed || typeof parsed !== 'object') return null;
+      return parsed;
     } catch (err) {
       console.log('Error reading state file, starting fresh:', err.message);
     }
@@ -68,6 +110,18 @@ function saveState(state) {
     fs.writeFileSync(CONFIG.DATA_FILE, JSON.stringify(state, null, 2));
   } catch (err) {
     console.error('Error saving state:', err.message);
+  }
+}
+
+// Problem 5 Fix: delete file instead of writing "null"
+function clearState() {
+  try {
+    if (fs.existsSync(CONFIG.DATA_FILE)) {
+      fs.unlinkSync(CONFIG.DATA_FILE);
+      console.log('✓ Cleared stale state file');
+    }
+  } catch (err) {
+    console.error('Error clearing state file:', err.message);
   }
 }
 
@@ -116,6 +170,11 @@ function extractNumberFromId(id) {
   return id.split('@')[0];
 }
 
+// Problem 6 Fix: Normalize phone numbers (strip non-digits)
+function normalizeNumber(num) {
+  return String(num).replace(/\D/g, '');
+}
+
 // ============================================
 // Load Auto-Punch Users from Config
 // ============================================
@@ -124,9 +183,10 @@ function loadAutoPunchUsers() {
   try {
     if (fs.existsSync(CONFIG.PUNCH_CONFIG_FILE)) {
       const config = JSON.parse(fs.readFileSync(CONFIG.PUNCH_CONFIG_FILE, 'utf-8'));
+      // Problem 6 Fix: normalize whatsapp numbers by stripping non-digit chars
       autoPunchUsers = (config.users || []).map(u => ({
         name: u.name,
-        whatsapp: u.whatsapp
+        whatsapp: normalizeNumber(u.whatsapp),
       }));
       console.log(`✓ Loaded ${autoPunchUsers.length} auto-punch users from config:`);
       autoPunchUsers.forEach(u => console.log(`  • ${u.name} (${u.whatsapp})`));
@@ -138,12 +198,18 @@ function loadAutoPunchUsers() {
 
 function categorizeParticipants() {
   const autoPunchNumbers = autoPunchUsers.map(u => u.whatsapp);
-  
+
   manualUsers = groupParticipants
-    .filter(id => !autoPunchNumbers.includes(extractNumberFromId(id)))
+    .filter(id => {
+      // Problem 6 Fix: normalize WA JID number before comparing
+      const normalized = normalizeNumber(extractNumberFromId(id));
+      const isAuto = autoPunchNumbers.includes(normalized);
+      console.log(`  [match] ${normalized} → ${isAuto ? 'auto-punch ✅' : 'manual 🖐️'}`);
+      return !isAuto;
+    })
     .map(id => ({
       id,
-      number: extractNumberFromId(id)
+      number: extractNumberFromId(id),
     }));
 
   console.log(`\n✓ Categorized participants:`);
@@ -185,14 +251,16 @@ function setupCronJobs() {
 
   // ===== PUNCH IN FLOW =====
 
-  // 9:05 AM - Check auto-punch IN results + tag manual users
+  // 9:15 AM - Check auto-punch IN results + tag manual users
+  // (was 9:05 AM — extended to 9:15 AM to allow ~15 min for punch_action.py
+  //  to process all users sequentially with separate browser instances)
   const punchInCheckJob = cron.schedule(
     `${CONFIG.PUNCH_IN_CHECK_MINUTE} ${CONFIG.PUNCH_IN_CHECK_HOUR} * * *`,
     async () => {
       if (isSunday() && CONFIG.SUNDAY_OFF) return;
-      console.log(`[9:05 AM] Checking punch-in status...`);
+      console.log(`[9:15 AM] Checking punch-in status...`);
       if (!groupId || !client) {
-        console.log(`[9:05 AM] Skipped: groupId=${!!groupId}, client=${!!client}`);
+        console.log(`[9:15 AM] Skipped: groupId=${!!groupId}, client=${!!client}`);
         return;
       }
 
@@ -244,14 +312,15 @@ function setupCronJobs() {
 
   // ===== PUNCH OUT FLOW =====
 
-  // 5:35 PM - Check auto-punch OUT results + tag manual users
+  // 5:45 PM - Check auto-punch OUT results + tag manual users
+  // (was 5:35 PM — extended to 5:45 PM to allow ~15 min for punch_action.py)
   const punchOutCheckJob = cron.schedule(
     `${CONFIG.PUNCH_OUT_CHECK_MINUTE} ${CONFIG.PUNCH_OUT_CHECK_HOUR} * * *`,
     async () => {
       if (isSunday() && CONFIG.SUNDAY_OFF) return;
-      console.log(`[5:35 PM] Checking punch-out status...`);
+      console.log(`[5:45 PM] Checking punch-out status...`);
       if (!groupId || !client) {
-        console.log(`[5:35 PM] Skipped: groupId=${!!groupId}, client=${!!client}`);
+        console.log(`[5:45 PM] Skipped: groupId=${!!groupId}, client=${!!client}`);
         return;
       }
 
@@ -326,9 +395,9 @@ function setupCronJobs() {
   cronjobs.push(motivationalJob);
 
   console.log('✓ Cron jobs scheduled:');
-  console.log('  9:05 AM  - Check punch-in + tag manual users');
+  console.log('  9:15 AM  - Check punch-in + tag manual users (was 9:05 AM)');
   console.log('  9:40 AM  - Follow-up for punch-in');
-  console.log('  5:35 PM  - Check punch-out + tag manual users');
+  console.log('  5:45 PM  - Check punch-out + tag manual users (was 5:35 PM)');
   console.log('  6:10 PM  - Follow-up for punch-out');
   console.log('  3:00 PM  - Motivational message\n');
 }
@@ -482,13 +551,14 @@ async function findAndCacheGroup() {
       const stateDate = new Date(savedState.createdAt);
       const today = new Date();
       const isToday = stateDate.toDateString() === today.toDateString();
-      
+
       if (isToday) {
         currentSessionState = savedState;
         console.log(`\n✓ Loaded previous session state (${savedState.currentSession})`);
       } else {
         console.log(`\n⚠️ Found old session state from ${stateDate.toDateString()}, discarding`);
-        saveState(null);
+        // Problem 5 Fix: delete the file instead of writing null
+        clearState();
       }
     }
 
@@ -557,14 +627,16 @@ function setupMessageListener() {
         } catch (err) {
           console.error('Error reacting to !pending:', err.message);
         }
+
+        // Problem 7 Fix: reply in the GROUP, not DM
         if (!currentSessionState) {
-          await client.sendMessage(senderId, '⚠️ No active session. Wait for the next punch reminder.');
+          await client.sendMessage(groupId, '⚠️ No active session. Wait for the next punch reminder.');
           return;
         }
 
         const pending = getPendingParticipants();
         if (pending.length === 0) {
-          await client.sendMessage(senderId, '✅ Everyone has completed their punch for this session!');
+          await client.sendMessage(groupId, '✅ Everyone has completed their punch for this session!');
           return;
         }
 
@@ -572,7 +644,53 @@ function setupMessageListener() {
         const lines = pending.map((p, i) => `${i + 1}. ${p.name}`);
         const text = `📋 *Pending ${sessionType}*\nSession: ${currentSessionState.currentSession}\n\n${lines.join('\n')}\n\nTotal pending: ${pending.length}`;
 
-        await client.sendMessage(senderId, text);
+        await client.sendMessage(groupId, text);
+      }
+
+      // Problem 11: !status command — reports bot health in the group
+      if (command === '!status') {
+        try {
+          const messageId = msg.id._serialized;
+          await client.sendReaction(messageId, '📊');
+        } catch (err) {
+          console.error('Error reacting to !status:', err.message);
+        }
+
+        const uptimeMs = Date.now() - startTime;
+        const uptimeHrs = Math.floor(uptimeMs / 3_600_000);
+        const uptimeMins = Math.floor((uptimeMs % 3_600_000) / 60_000);
+        const uptimeSecs = Math.floor((uptimeMs % 60_000) / 1_000);
+        const uptimeStr = `${uptimeHrs}h ${uptimeMins}m ${uptimeSecs}s`;
+
+        const sessionInfo = currentSessionState
+          ? `${currentSessionState.currentSession} (started ${new Date(currentSessionState.createdAt).toLocaleTimeString('en-IN', { timeZone: CONFIG.TIMEZONE })})`
+          : 'None (between sessions)';
+
+        const pending = getPendingParticipants();
+
+        let statusFileInfo = '❌ Not found';
+        try {
+          if (fs.existsSync(CONFIG.PUNCH_STATUS_FILE)) {
+            const stat = fs.statSync(CONFIG.PUNCH_STATUS_FILE);
+            const mtime = stat.mtime.toLocaleString('en-IN', { timeZone: CONFIG.TIMEZONE });
+            statusFileInfo = `✅ Last updated: ${mtime}`;
+          }
+        } catch (_) { /* ignore */ }
+
+        const cronStatus = cronjobs.length > 0 ? `✅ ${cronjobs.length} jobs active` : '❌ Not running';
+
+        let statusMsg = `📊 *Bot Status*\n`;
+        statusMsg += `━━━━━━━━━━━━━━━━━━━━\n`;
+        statusMsg += `🕒 *Uptime:* ${uptimeStr}\n`;
+        statusMsg += `📅 *Session:* ${sessionInfo}\n`;
+        statusMsg += `👥 *Pending:* ${pending.length} participant(s)\n`;
+        statusMsg += `📁 *Status file:* ${statusFileInfo}\n`;
+        statusMsg += `⚙️ *Cron jobs:* ${cronStatus}\n`;
+        statusMsg += `━━━━━━━━━━━━━━━━━━━━\n`;
+        statusMsg += `_Next check-in: 9:15 AM | Check-out: 5:45 PM_`;
+
+        await client.sendMessage(groupId, statusMsg);
+        console.log('✓ !status report sent to group');
       }
     } catch (err) {
       console.error('Error processing message:', err.message);
@@ -601,9 +719,30 @@ async function connectToWhatsApp() {
   console.log(`  Punch Status File: ${CONFIG.PUNCH_STATUS_FILE}`);
   console.log(`  Punch Config File: ${CONFIG.PUNCH_CONFIG_FILE}\n`);
 
+  // Problem 1 Fix: Remove stale Chromium lock files BEFORE creating Client
+  console.log('🧹 Cleaning stale lock files...');
+  cleanStaleLockFiles();
+
+  // Problem 12 Fix: Gracefully destroy previous client before creating new one
+  if (client) {
+    console.log('🔄 Destroying previous client instance...');
+    try {
+      await client.destroy();
+    } catch (e) {
+      console.log('  (destroy error ignored):', e.message);
+    }
+    client = null;
+    // Give Chromium time to fully exit before spawning a new instance
+    await new Promise(r => setTimeout(r, 3000));
+    console.log('✓ Previous client destroyed, waiting 3s...');
+  }
+
+  // Problem 2 Fix: Increased protocolTimeout to 300000 (5 min)
+  // Problem 1 Fix: Added --disable-background-media-suspend
+  // Problem 2 Fix: Added --disable-renderer-backgrounding, --disable-ipc-flooding-protection
   const puppeteerConfig = {
     headless: true,
-    protocolTimeout: 120000,
+    protocolTimeout: 300000, // was 120000 → now 300000 (5 min)
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
@@ -617,7 +756,10 @@ async function connectToWhatsApp() {
       '--disable-blink-features=AutomationControlled',
       '--disable-features=NetworkService',
       '--disable-background-networking',
-      '--disable-background-timer-throttling'
+      '--disable-background-timer-throttling',
+      '--disable-background-media-suspend',    // Problem 1 Fix
+      '--disable-renderer-backgrounding',      // Problem 2 Fix
+      '--disable-ipc-flooding-protection',     // Problem 2 Fix
     ],
   };
 
@@ -647,7 +789,7 @@ async function connectToWhatsApp() {
 
   client.on('loading_screen', (percent, message) => {
     console.log(`⏳ Loading Screen: ${percent}% - ${message}`);
-    
+
     if (percent === lastLoadingPercent) {
       if (!loadingStuckSince) {
         loadingStuckSince = Date.now();
@@ -662,7 +804,7 @@ async function connectToWhatsApp() {
       loadingStuckSince = null;
       lastLoadingPercent = percent;
     }
-    
+
     if (loadingTimeout) clearTimeout(loadingTimeout);
     loadingTimeout = setTimeout(() => {
       console.log('⚠️ Loading screen timeout (120s), restarting...');
@@ -675,13 +817,17 @@ async function connectToWhatsApp() {
     if (loadingTimeout) clearTimeout(loadingTimeout);
     loadingStuckSince = null;
     lastLoadingPercent = 0;
+    // Problem 3 Fix: reset connectionAttempts on SUCCESSFUL connection
+    connectionAttempts = 0;
     console.log('\n✓ Connected to WhatsApp!');
     console.log('⏳ Loading chats...\n');
     await findAndCacheGroup();
   });
 
+  // Problem 3 Fix: reset connectionAttempts before reconnecting on disconnect
   client.on('disconnected', (reason) => {
     console.log('\n❌ Disconnected:', reason);
+    connectionAttempts = 0; // reset so reconnect gets a fresh slate
     console.log('⏳ Reconnecting in 5 seconds...\n');
     setTimeout(() => connectToWhatsApp(), 5000);
   });
@@ -691,11 +837,12 @@ async function connectToWhatsApp() {
   } catch (err) {
     connectionAttempts++;
     console.error(`\n❌ Error during initialization (attempt ${connectionAttempts}/${RETRY_CONFIG.maxRetries}):`, err.message);
-    
+
     if (connectionAttempts < RETRY_CONFIG.maxRetries) {
-      console.log(`⏳ Retrying in ${RETRY_CONFIG.retryDelay/1000} seconds...\n`);
+      console.log(`⏳ Retrying in ${RETRY_CONFIG.retryDelay / 1000} seconds...\n`);
       setTimeout(() => {
-        connectionAttempts = 0;
+        // NOTE: Do NOT reset connectionAttempts here — let it increment until
+        // a successful 'ready' event resets it (Problem 3 Fix)
         connectToWhatsApp();
       }, RETRY_CONFIG.retryDelay);
     } else {
@@ -722,6 +869,18 @@ process.on('SIGINT', async () => {
     console.log('✓ WhatsApp connection closed');
   }
   console.log('✓ Goodbye!\n');
+  process.exit(0);
+});
+
+process.on('SIGTERM', async () => {
+  console.log('\n\n⏹️  SIGTERM received, shutting down...');
+  if (currentSessionState) {
+    saveState(currentSessionState);
+  }
+  cronjobs.forEach((job) => job.stop());
+  if (client) {
+    try { await client.destroy(); } catch (_) {}
+  }
   process.exit(0);
 });
 
