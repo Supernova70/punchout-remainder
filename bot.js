@@ -155,7 +155,11 @@ function categorizeParticipants() {
 
 async function sendMessage(chatId, text, mentions) {
   if (!client) {
-    console.log('Client not connected, cannot send message');
+    console.log('sendMessage: Client not connected');
+    return;
+  }
+  if (!chatId) {
+    console.log('sendMessage: chatId is null');
     return;
   }
   try {
@@ -184,7 +188,10 @@ function setupCronJobs() {
     async () => {
       if (isSunday() && CONFIG.SUNDAY_OFF) return;
       console.log(`[9:05 AM] Checking punch-in status...`);
-      if (!groupId || !client) return;
+      if (!groupId || !client) {
+        console.log(`[9:05 AM] Skipped: groupId=${!!groupId}, client=${!!client}`);
+        return;
+      }
 
       initializeSessionState('morning');
 
@@ -208,7 +215,10 @@ function setupCronJobs() {
     async () => {
       if (isSunday() && CONFIG.SUNDAY_OFF) return;
       console.log(`[9:40 AM] Sending punch-in follow-up...`);
-      if (!groupId || !client || !currentSessionState) return;
+      if (!groupId || !client || !currentSessionState) {
+        console.log(`[Follow-up] Skipped: groupId=${!!groupId}, client=${!!client}, state=${!!currentSessionState}`);
+        return;
+      }
 
       const pending = getPendingParticipants();
       if (pending.length === 0) {
@@ -237,7 +247,10 @@ function setupCronJobs() {
     async () => {
       if (isSunday() && CONFIG.SUNDAY_OFF) return;
       console.log(`[5:35 PM] Checking punch-out status...`);
-      if (!groupId || !client) return;
+      if (!groupId || !client) {
+        console.log(`[5:35 PM] Skipped: groupId=${!!groupId}, client=${!!client}`);
+        return;
+      }
 
       initializeSessionState('evening');
 
@@ -261,7 +274,10 @@ function setupCronJobs() {
     async () => {
       if (isSunday() && CONFIG.SUNDAY_OFF) return;
       console.log(`[6:10 PM] Sending punch-out follow-up...`);
-      if (!groupId || !client || !currentSessionState) return;
+      if (!groupId || !client || !currentSessionState) {
+        console.log(`[Follow-up] Skipped: groupId=${!!groupId}, client=${!!client}, state=${!!currentSessionState}`);
+        return;
+      }
 
       const pending = getPendingParticipants();
       if (pending.length === 0) {
@@ -288,7 +304,10 @@ function setupCronJobs() {
     async () => {
       if (isSunday() && CONFIG.SUNDAY_OFF) return;
       console.log(`[3:00 PM] Sending motivational message`);
-      if (!groupId || !client) return;
+      if (!groupId || !client) {
+        console.log(`[3:00 PM] Skipped: groupId=${!!groupId}, client=${!!client}`);
+        return;
+      }
 
       const mentionText = groupParticipants
         .map((id) => `@${extractNumberFromId(id)}`)
@@ -457,8 +476,17 @@ async function findAndCacheGroup() {
 
     const savedState = loadState();
     if (savedState) {
-      currentSessionState = savedState;
-      console.log(`\n✓ Loaded previous session state (${savedState.currentSession})`);
+      const stateDate = new Date(savedState.createdAt);
+      const today = new Date();
+      const isToday = stateDate.toDateString() === today.toDateString();
+      
+      if (isToday) {
+        currentSessionState = savedState;
+        console.log(`\n✓ Loaded previous session state (${savedState.currentSession})`);
+      } else {
+        console.log(`\n⚠️ Found old session state from ${stateDate.toDateString()}, discarding`);
+        saveState(null);
+      }
     }
 
     console.log('\n✓ Bot ready! Cron jobs are active and listening for messages.\n');
@@ -572,6 +600,7 @@ async function connectToWhatsApp() {
 
   const puppeteerConfig = {
     headless: true,
+    protocolTimeout: 120000,
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
