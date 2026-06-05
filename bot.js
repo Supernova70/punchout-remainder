@@ -766,6 +766,9 @@ async function connectToWhatsApp() {
   client = new Client({
     authStrategy: new LocalAuth(),
     puppeteer: puppeteerConfig,
+    // Prevent media (images/videos/memes) from being downloaded to .wwebjs_cache/
+    // In a busy group this would fill disk very quickly. We only need text messages.
+    downloadMedia: false,
     userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
   });
 
