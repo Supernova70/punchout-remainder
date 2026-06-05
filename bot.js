@@ -47,6 +47,9 @@ const RETRY_CONFIG = {
 };
 
 let connectionAttempts = 0;
+let loadingTimeout = null;
+let lastLoadingPercent = 0;
+let loadingStuckSince = null;
 
 function loadState() {
   if (fs.existsSync(CONFIG.DATA_FILE)) {
@@ -611,7 +614,10 @@ async function connectToWhatsApp() {
       '--disable-default-apps',
       '--disable-extensions',
       '--disable-sync',
-      '--disable-blink-features=AutomationControlled'
+      '--disable-blink-features=AutomationControlled',
+      '--disable-features=NetworkService',
+      '--disable-background-networking',
+      '--disable-background-timer-throttling'
     ],
   };
 
@@ -641,9 +647,34 @@ async function connectToWhatsApp() {
 
   client.on('loading_screen', (percent, message) => {
     console.log(`⏳ Loading Screen: ${percent}% - ${message}`);
+    
+    if (percent === lastLoadingPercent) {
+      if (!loadingStuckSince) {
+        loadingStuckSince = Date.now();
+      } else if (Date.now() - loadingStuckSince > 60000) {
+        console.log('⚠️ Loading stuck at same percentage for 60s, restarting...');
+        if (loadingTimeout) clearTimeout(loadingTimeout);
+        client.destroy().catch(() => {});
+        setTimeout(() => connectToWhatsApp(), 5000);
+        return;
+      }
+    } else {
+      loadingStuckSince = null;
+      lastLoadingPercent = percent;
+    }
+    
+    if (loadingTimeout) clearTimeout(loadingTimeout);
+    loadingTimeout = setTimeout(() => {
+      console.log('⚠️ Loading screen timeout (120s), restarting...');
+      client.destroy().catch(() => {});
+      setTimeout(() => connectToWhatsApp(), 5000);
+    }, 120000);
   });
 
   client.on('ready', async () => {
+    if (loadingTimeout) clearTimeout(loadingTimeout);
+    loadingStuckSince = null;
+    lastLoadingPercent = 0;
     console.log('\n✓ Connected to WhatsApp!');
     console.log('⏳ Loading chats...\n');
     await findAndCacheGroup();
