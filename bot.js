@@ -277,11 +277,14 @@ function setupCronJobs() {
       // Read the punch status file
       const statusData = readPunchStatus();
       if (statusData && statusData.action === 'in') {
-        // Send auto-punch report
+        // Pre-mark auto-punched users as done so they don't appear in
+        // pending lists or follow-up tags (they're already handled)
+        markAutoPunchUsersAsDone(statusData);
+        // Send auto-punch report to group
         await sendPunchReport(statusData);
       }
 
-      // Send reminder to manual users
+      // Send reminder to manual users only (auto-punch users already marked done)
       await sendManualReminder('in');
     },
     { timezone: CONFIG.TIMEZONE }
@@ -337,11 +340,14 @@ function setupCronJobs() {
       // Read the punch status file
       const statusData = readPunchStatus();
       if (statusData && statusData.action === 'out') {
-        // Send auto-punch report
+        // Pre-mark auto-punched users as done so they don't appear in
+        // pending lists or follow-up tags (they're already handled)
+        markAutoPunchUsersAsDone(statusData);
+        // Send auto-punch report to group
         await sendPunchReport(statusData);
       }
 
-      // Send reminder to manual users
+      // Send reminder to manual users only (auto-punch users already marked done)
       await sendManualReminder('out');
     },
     { timezone: CONFIG.TIMEZONE }
@@ -413,6 +419,39 @@ function setupCronJobs() {
 // ============================================
 // Punch Status Helpers
 // ============================================
+
+// Pre-mark auto-punched users as done in the current session state so they:
+//   1. Never appear in getPendingParticipants() / !pending list
+//   2. Never get tagged in follow-up reminders
+//   3. Still appear in the 3PM motivational message (that uses groupParticipants, not pending list)
+function markAutoPunchUsersAsDone(statusData) {
+  if (!statusData || !currentSessionState) return 0;
+  const results = statusData.results || [];
+  let markedCount = 0;
+
+  for (const result of results) {
+    if (!['SUCCESS', 'ALREADY_DONE'].includes(result.status)) continue;
+    if (!result.whatsapp) continue;
+
+    const normalizedWa = normalizeNumber(result.whatsapp);
+    // Find the participant JID whose number matches the auto-punch result
+    const matchingId = Object.keys(currentSessionState.participants).find(
+      id => normalizeNumber(extractNumberFromId(id)) === normalizedWa
+    );
+
+    if (matchingId) {
+      currentSessionState.participants[matchingId].done = true;
+      markedCount++;
+      console.log(`✓ Pre-marked ${result.name} as done (auto-punch: ${result.status})`);
+    } else {
+      console.warn(`⚠️ Auto-punch result for ${result.name} (${normalizedWa}) not found in group participants`);
+    }
+  }
+
+  if (markedCount > 0) saveState(currentSessionState);
+  console.log(`✓ ${markedCount} auto-punch user(s) pre-marked as done`);
+  return markedCount;
+}
 
 function readPunchStatus() {
   try {
@@ -653,20 +692,21 @@ function setupMessageListener() {
           console.error('Error reacting to !pending:', err.message);
         }
 
-        // Send reply to sender's DM — not the group — to keep chat clean
-        const dmId = `${extractNumberFromId(senderId)}@c.us`;
-
+        // Send reply to sender's DM — not the group — to keep chat clean.
+        // Fix: use senderId (msg.author) directly as the DM target.
+        // Reconstructing '${number}@c.us' breaks for users identified by LID
+        // in newer WhatsApp versions, causing 'No LID for user' crash.
         if (!currentSessionState) {
-          await client.sendMessage(dmId, '⚠️ No active session right now. Wait for the next punch reminder.');
+          await client.sendMessage(senderId, '⚠️ No active session right now. Wait for the next punch reminder.');
         } else {
           const pending = getPendingParticipants();
           if (pending.length === 0) {
-            await client.sendMessage(dmId, '✅ Everyone has completed their punch for this session!');
+            await client.sendMessage(senderId, '✅ Everyone has completed their punch for this session!');
           } else {
             const sessionType = currentSessionState.currentSession === 'morning' ? 'Punch In' : 'Punch Out';
             const lines = pending.map((p, i) => `${i + 1}. ${p.name}`);
             const replyText = `📋 *Pending ${sessionType}*\nSession: ${currentSessionState.currentSession}\n\n${lines.join('\n')}\n\nTotal pending: ${pending.length}`;
-            await client.sendMessage(dmId, replyText);
+            await client.sendMessage(senderId, replyText);
           }
         }
         console.log(`✓ !pending result sent as DM to ${extractNumberFromId(senderId)}`);
@@ -712,9 +752,9 @@ function setupMessageListener() {
         statusMsg += `━━━━━━━━━━━━━━━━━━━━\n`;
         statusMsg += `_Next check-in: 9:15 AM | Check-out: 5:45 PM_`;
 
-        // Send reply to sender's DM — not the group — to keep chat clean
-        const dmId = `${extractNumberFromId(senderId)}@c.us`;
-        await client.sendMessage(dmId, statusMsg);
+        // Send reply to sender's DM — not the group — to keep chat clean.
+        // Fix: use senderId (msg.author) directly — avoids 'No LID for user' crash.
+        await client.sendMessage(senderId, statusMsg);
         console.log(`✓ !status report sent as DM to ${extractNumberFromId(senderId)}`);
       }
 
