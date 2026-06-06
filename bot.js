@@ -8,7 +8,7 @@ const { Client, LocalAuth } = require('whatsapp-web.js');
 // CONFIGURATION - Customize these values
 // ============================================
 const CONFIG = {
-  GROUP_NAME: 'CL Chat',
+  GROUP_NAME: 'CL Testing',
   TIMEZONE: 'Asia/Kolkata',
   SUNDAY_OFF: true,
   DATA_FILE: './punch_data.json',
@@ -38,6 +38,8 @@ const CONFIG = {
 
 let client = null;
 let groupId = null;
+let botJid = null; // Bug 1 Fix: bot's own JID to exclude from participants
+let messageListenerRegistered = false; // Bug 2 Fix: prevent stacking duplicate listeners
 let groupParticipants = [];
 let autoPunchUsers = []; // Users with auto-punch configured
 let manualUsers = []; // Users who need to punch manually
@@ -128,6 +130,8 @@ function clearState() {
 function initializeSessionState(sessionType) {
   const participants = {};
   groupParticipants.forEach((id) => {
+    // Bug 1 Fix: skip the bot's own JID so it never appears in the pending list
+    if (botJid && id === botJid) return;
     participants[id] = {
       done: false,
       name: extractNumberFromId(id),
@@ -163,7 +167,11 @@ function getPendingParticipants() {
 }
 
 function isSunday() {
-  return new Date().getDay() === 0;
+  // Bug 6 Fix: use IST-aware day check instead of server local time (EC2 is UTC by default).
+  // At UTC midnight, IST is already 5:30 AM — so getDay() on UTC time would wrongly
+  // treat the last 30 min of IST Saturday as Sunday.
+  const nowIST = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
+  return nowIST.getDay() === 0;
 }
 
 function extractNumberFromId(id) {
@@ -576,6 +584,15 @@ async function findAndCacheGroup() {
 // ============================================
 
 function setupMessageListener() {
+  // Bug 2 Fix: only register the listener once per client lifetime.
+  // findAndCacheGroup() is called on every reconnect; without this guard
+  // each reconnect stacks another listener → messages processed N× times.
+  if (messageListenerRegistered) {
+    console.log('✓ Message listener already registered, skipping');
+    return;
+  }
+  messageListenerRegistered = true;
+
   client.on('message', async (msg) => {
     try {
       const chat = await msg.getChat();
@@ -583,19 +600,29 @@ function setupMessageListener() {
       if (!chat.isGroup || chat.id._serialized !== groupId) return;
       if (msg.fromMe) return;
 
+      // Bug 4 Fix: msg.body is null for stickers, images, voice notes, reactions.
+      // .trim() on null throws TypeError — guard early and skip non-text messages.
       const text = msg.body;
-      const senderId = msg.author || msg.from;
+      if (!text || !text.trim()) return;
 
-      if (text) {
-        console.log(`[${extractNumberFromId(senderId)}] ${text}`);
+      // Bug 3 Fix: in a group, msg.author is the sender's JID and msg.from is
+      // the GROUP's JID. Never fall back to msg.from for DMs.
+      const senderId = msg.author;
+      if (!senderId) {
+        console.warn('⚠️ Could not determine senderId (msg.author missing), skipping command');
+        return;
       }
+
+      console.log(`[${extractNumberFromId(senderId)}] ${text}`);
 
       const command = text.trim().toLowerCase();
 
+      // Bug 5 Fix: use else-if chain so commands are mutually exclusive
+      // and intent is clear — no accidental fall-through.
       if (command === '!done') {
+        // React in group only — no DM reply needed (confirmed by user)
         try {
-          const messageId = msg.id._serialized;
-          await client.sendReaction(messageId, '✅');
+          await client.sendReaction(msg.id._serialized, '✅');
           console.log('✓ Reacted to !done with ✅');
         } catch (err) {
           console.error('Error reacting to !done:', err.message);
@@ -606,52 +633,48 @@ function setupMessageListener() {
             console.log(`✓ ${extractNumberFromId(senderId)} marked as done for ${currentSessionState.currentSession} session`);
           }
         }
-      }
 
-      if (command === '!ping') {
+      } else if (command === '!ping') {
+        // !ping → reply in GROUP (intentional — just a liveness check)
         try {
-          const messageId = msg.id._serialized;
-          await client.sendReaction(messageId, '🏓');
+          await client.sendReaction(msg.id._serialized, '🏓');
           console.log('✓ Reacted to !ping with 🏓');
         } catch (err) {
           console.error('Error reacting to !ping:', err.message);
         }
         await sendMessage(groupId, '🏓 Pong!');
-      }
 
-      if (command === '!pending') {
+      } else if (command === '!pending') {
+        // React in group so sender sees acknowledgement, then DM the list
         try {
-          const messageId = msg.id._serialized;
-          await client.sendReaction(messageId, '📋');
+          await client.sendReaction(msg.id._serialized, '📋');
           console.log('✓ Reacted to !pending with 📋');
         } catch (err) {
           console.error('Error reacting to !pending:', err.message);
         }
 
-        // Problem 7 Fix: reply in the GROUP, not DM
+        // Send reply to sender's DM — not the group — to keep chat clean
+        const dmId = `${extractNumberFromId(senderId)}@c.us`;
+
         if (!currentSessionState) {
-          await client.sendMessage(groupId, '⚠️ No active session. Wait for the next punch reminder.');
-          return;
+          await client.sendMessage(dmId, '⚠️ No active session right now. Wait for the next punch reminder.');
+        } else {
+          const pending = getPendingParticipants();
+          if (pending.length === 0) {
+            await client.sendMessage(dmId, '✅ Everyone has completed their punch for this session!');
+          } else {
+            const sessionType = currentSessionState.currentSession === 'morning' ? 'Punch In' : 'Punch Out';
+            const lines = pending.map((p, i) => `${i + 1}. ${p.name}`);
+            const replyText = `📋 *Pending ${sessionType}*\nSession: ${currentSessionState.currentSession}\n\n${lines.join('\n')}\n\nTotal pending: ${pending.length}`;
+            await client.sendMessage(dmId, replyText);
+          }
         }
+        console.log(`✓ !pending result sent as DM to ${extractNumberFromId(senderId)}`);
 
-        const pending = getPendingParticipants();
-        if (pending.length === 0) {
-          await client.sendMessage(groupId, '✅ Everyone has completed their punch for this session!');
-          return;
-        }
-
-        const sessionType = currentSessionState.currentSession === 'morning' ? 'Punch In' : 'Punch Out';
-        const lines = pending.map((p, i) => `${i + 1}. ${p.name}`);
-        const text = `📋 *Pending ${sessionType}*\nSession: ${currentSessionState.currentSession}\n\n${lines.join('\n')}\n\nTotal pending: ${pending.length}`;
-
-        await client.sendMessage(groupId, text);
-      }
-
-      // Problem 11: !status command — reports bot health in the group
-      if (command === '!status') {
+      } else if (command === '!status') {
+        // React in group so sender sees acknowledgement, then DM the status
         try {
-          const messageId = msg.id._serialized;
-          await client.sendReaction(messageId, '📊');
+          await client.sendReaction(msg.id._serialized, '📊');
         } catch (err) {
           console.error('Error reacting to !status:', err.message);
         }
@@ -666,7 +689,7 @@ function setupMessageListener() {
           ? `${currentSessionState.currentSession} (started ${new Date(currentSessionState.createdAt).toLocaleTimeString('en-IN', { timeZone: CONFIG.TIMEZONE })})`
           : 'None (between sessions)';
 
-        const pending = getPendingParticipants();
+        const pendingList = getPendingParticipants();
 
         let statusFileInfo = '❌ Not found';
         try {
@@ -683,21 +706,24 @@ function setupMessageListener() {
         statusMsg += `━━━━━━━━━━━━━━━━━━━━\n`;
         statusMsg += `🕒 *Uptime:* ${uptimeStr}\n`;
         statusMsg += `📅 *Session:* ${sessionInfo}\n`;
-        statusMsg += `👥 *Pending:* ${pending.length} participant(s)\n`;
+        statusMsg += `👥 *Pending:* ${pendingList.length} participant(s)\n`;
         statusMsg += `📁 *Status file:* ${statusFileInfo}\n`;
         statusMsg += `⚙️ *Cron jobs:* ${cronStatus}\n`;
         statusMsg += `━━━━━━━━━━━━━━━━━━━━\n`;
         statusMsg += `_Next check-in: 9:15 AM | Check-out: 5:45 PM_`;
 
-        await client.sendMessage(groupId, statusMsg);
-        console.log('✓ !status report sent to group');
+        // Send reply to sender's DM — not the group — to keep chat clean
+        const dmId = `${extractNumberFromId(senderId)}@c.us`;
+        await client.sendMessage(dmId, statusMsg);
+        console.log(`✓ !status report sent as DM to ${extractNumberFromId(senderId)}`);
       }
+
     } catch (err) {
       console.error('Error processing message:', err.message);
     }
   });
 
-  console.log('✓ Message listener setup');
+  console.log('✓ Message listener registered');
 }
 
 // ============================================
@@ -820,17 +846,20 @@ async function connectToWhatsApp() {
     if (loadingTimeout) clearTimeout(loadingTimeout);
     loadingStuckSince = null;
     lastLoadingPercent = 0;
-    // Problem 3 Fix: reset connectionAttempts on SUCCESSFUL connection
     connectionAttempts = 0;
-    console.log('\n✓ Connected to WhatsApp!');
+    // Bug 1 Fix: capture the bot's own JID so it can be excluded from participants
+    botJid = client.info.wid._serialized;
+    console.log(`\n✓ Connected to WhatsApp! (bot JID: ${botJid})`);
     console.log('⏳ Loading chats...\n');
     await findAndCacheGroup();
   });
 
-  // Problem 3 Fix: reset connectionAttempts before reconnecting on disconnect
   client.on('disconnected', (reason) => {
     console.log('\n❌ Disconnected:', reason);
     connectionAttempts = 0; // reset so reconnect gets a fresh slate
+    // Bug 2 Fix: reset the listener flag so the new client instance
+    // registers a fresh listener instead of being skipped
+    messageListenerRegistered = false;
     console.log('⏳ Reconnecting in 5 seconds...\n');
     setTimeout(() => connectToWhatsApp(), 5000);
   });
