@@ -41,6 +41,7 @@ let groupId = null;
 let botJid = null; // Bug 1 Fix: bot's own JID to exclude from participants
 let messageListenerRegistered = false; // Bug 2 Fix: prevent stacking duplicate listeners
 let groupParticipants = [];
+let participantNames = {}; // JID → display name (fetched from WA contact info)
 let autoPunchUsers = []; // Users with auto-punch configured
 let manualUsers = []; // Users who need to punch manually
 let currentSessionState = null;
@@ -134,7 +135,8 @@ function initializeSessionState(sessionType) {
     if (botJid && id === botJid) return;
     participants[id] = {
       done: false,
-      name: extractNumberFromId(id),
+      // Use the human-readable display name fetched at startup; fall back to number
+      name: participantNames[id] || extractNumberFromId(id),
     };
   });
 
@@ -584,9 +586,25 @@ async function findAndCacheGroup() {
 
     groupParticipants = targetGroup.participants.map((p) => p.id._serialized);
 
+    // Fetch real display names for all participants so !pending shows names, not numbers.
+    // Priority: address book name → WhatsApp push name → phone number fallback.
+    console.log(`⏳ Fetching contact names for ${groupParticipants.length} participants...`);
+    participantNames = {};
+    for (const id of groupParticipants) {
+      if (botJid && id === botJid) continue; // skip self
+      try {
+        const contact = await client.getContactById(id);
+        const displayName = contact.name || contact.pushname || extractNumberFromId(id);
+        participantNames[id] = displayName;
+      } catch (_) {
+        participantNames[id] = extractNumberFromId(id); // safe fallback
+      }
+    }
+
     console.log(`✓ Cached ${groupParticipants.length} participants:`);
     groupParticipants.forEach((id) => {
-      console.log(`  • ${extractNumberFromId(id)}`);
+      const name = participantNames[id] || extractNumberFromId(id);
+      console.log(`  • ${name} (${extractNumberFromId(id)})`);
     });
 
     // Load auto-punch users and categorize
@@ -900,6 +918,7 @@ async function connectToWhatsApp() {
     // Bug 2 Fix: reset the listener flag so the new client instance
     // registers a fresh listener instead of being skipped
     messageListenerRegistered = false;
+    participantNames = {}; // clear stale names; will be re-fetched on next ready
     console.log('⏳ Reconnecting in 5 seconds...\n');
     setTimeout(() => connectToWhatsApp(), 5000);
   });
