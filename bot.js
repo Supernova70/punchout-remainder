@@ -310,7 +310,7 @@ function setupCronJobs() {
         return;
       }
 
-      const pendingMentions = pending.map((p) => `@${p.name}`).join(' ');
+      const pendingMentions = pending.map((p) => `@${extractNumberFromId(p.id)}`).join(' ');
       const mentions = pending.map((p) => p.id);
 
       const text = `⏰ *Reminder:* These people still need to punch in:\n\n${pendingMentions}\n\nPlease punch in and reply !done`;
@@ -373,7 +373,7 @@ function setupCronJobs() {
         return;
       }
 
-      const pendingMentions = pending.map((p) => `@${p.name}`).join(' ');
+      const pendingMentions = pending.map((p) => `@${extractNumberFromId(p.id)}`).join(' ');
       const mentions = pending.map((p) => p.id);
 
       const text = `⏰ *Reminder:* These people still need to punch out:\n\n${pendingMentions}\n\nPlease punch out and reply !done`;
@@ -664,11 +664,15 @@ function setupMessageListener() {
 
       // Bug 3 Fix: in a group, msg.author is the sender's JID and msg.from is
       // the GROUP's JID. Never fall back to msg.from for DMs.
-      const senderId = msg.author;
-      if (!senderId) {
+      const senderIdRaw = msg.author;
+      if (!senderIdRaw) {
         console.warn('⚠️ Could not determine senderId (msg.author missing), skipping command');
         return;
       }
+      
+      // Fix: Remove device ID from sender JID (e.g., 1234:1@c.us -> 1234@c.us)
+      // so it matches the participant ID format
+      const senderId = senderIdRaw.replace(/:\d+@/, '@');
 
       console.log(`[${extractNumberFromId(senderId)}] ${text}`);
 
@@ -676,10 +680,10 @@ function setupMessageListener() {
 
       // Bug 5 Fix: use else-if chain so commands are mutually exclusive
       // and intent is clear — no accidental fall-through.
-      if (command === '!done') {
+      if (command.includes('!done')) {
         // React in group only — no DM reply needed (confirmed by user)
         try {
-          await client.sendReaction(msg.id._serialized, '✅');
+          await msg.react('✅');
           console.log('✓ Reacted to !done with ✅');
         } catch (err) {
           console.error('Error reacting to !done:', err.message);
@@ -694,7 +698,7 @@ function setupMessageListener() {
       } else if (command === '!ping') {
         // !ping → reply in GROUP (intentional — just a liveness check)
         try {
-          await client.sendReaction(msg.id._serialized, '🏓');
+          await msg.react('🏓');
           console.log('✓ Reacted to !ping with 🏓');
         } catch (err) {
           console.error('Error reacting to !ping:', err.message);
@@ -704,7 +708,7 @@ function setupMessageListener() {
       } else if (command === '!pending') {
         // React in group so sender sees acknowledgement, then DM the list
         try {
-          await client.sendReaction(msg.id._serialized, '📋');
+          await msg.react('📋');
           console.log('✓ Reacted to !pending with 📋');
         } catch (err) {
           console.error('Error reacting to !pending:', err.message);
@@ -732,7 +736,7 @@ function setupMessageListener() {
       } else if (command === '!status') {
         // React in group so sender sees acknowledgement, then DM the status
         try {
-          await client.sendReaction(msg.id._serialized, '📊');
+          await msg.react('📊');
         } catch (err) {
           console.error('Error reacting to !status:', err.message);
         }
