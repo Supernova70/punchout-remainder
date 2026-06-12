@@ -153,11 +153,21 @@ function initializeSessionState(sessionType) {
 }
 
 function markAsDone(id) {
-  if (currentSessionState && currentSessionState.participants[id]) {
-    currentSessionState.participants[id].done = true;
-    saveState(currentSessionState);
-    return true;
+  if (!currentSessionState) return false;
+
+  const normalizedId = normalizeNumber(extractNumberFromId(id));
+  
+  for (const key in currentSessionState.participants) {
+    if (normalizeNumber(extractNumberFromId(key)) === normalizedId) {
+      if (currentSessionState.participants[key].done) {
+        return false; // Already done
+      }
+      currentSessionState.participants[key].done = true;
+      saveState(currentSessionState);
+      return true; // Successfully marked
+    }
   }
+  
   return false;
 }
 
@@ -584,14 +594,16 @@ async function findAndCacheGroup() {
     console.log(`✓ Found group: "${CONFIG.GROUP_NAME}"`);
     console.log(`  Group ID: ${groupId}\n`);
 
-    groupParticipants = targetGroup.participants.map((p) => p.id._serialized);
+    const normalizedBotNumber = botJid ? normalizeNumber(extractNumberFromId(botJid)) : null;
+    groupParticipants = targetGroup.participants
+      .map((p) => p.id._serialized)
+      .filter((id) => !normalizedBotNumber || normalizeNumber(extractNumberFromId(id)) !== normalizedBotNumber);
 
     // Fetch real display names for all participants so !pending shows names, not numbers.
     // Priority: address book name → WhatsApp push name → phone number fallback.
     console.log(`⏳ Fetching contact names for ${groupParticipants.length} participants...`);
     participantNames = {};
     for (const id of groupParticipants) {
-      if (botJid && id === botJid) continue; // skip self
       try {
         const contact = await client.getContactById(id);
         const displayName = contact.name || contact.pushname || extractNumberFromId(id);
@@ -681,17 +693,19 @@ function setupMessageListener() {
       // Bug 5 Fix: use else-if chain so commands are mutually exclusive
       // and intent is clear — no accidental fall-through.
       if (command.includes('!done')) {
-        // React in group only — no DM reply needed (confirmed by user)
-        try {
-          await msg.react('✅');
-          console.log('✓ Reacted to !done with ✅');
-        } catch (err) {
-          console.error('Error reacting to !done:', err.message);
-        }
         if (currentSessionState) {
           const wasMarked = markAsDone(senderId);
           if (wasMarked) {
+            // React in group only if they were just marked as done
+            try {
+              await msg.react('✅');
+              console.log('✓ Reacted to !done with ✅');
+            } catch (err) {
+              console.error('Error reacting to !done:', err.message);
+            }
             console.log(`✓ ${extractNumberFromId(senderId)} marked as done for ${currentSessionState.currentSession} session`);
+          } else {
+            console.log(`  [Ignore] ${extractNumberFromId(senderId)} already marked done or not found.`);
           }
         }
 
