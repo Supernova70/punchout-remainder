@@ -39,7 +39,6 @@ const CONFIG = {
 let client = null;
 let groupId = null;
 let botJid = null; // Bug 1 Fix: bot's own JID to exclude from participants
-let messageListenerRegistered = false; // Bug 2 Fix: prevent stacking duplicate listeners
 let groupParticipants = [];
 let participantNames = {}; // JID → display name (fetched from WA contact info)
 let autoPunchUsers = []; // Users with auto-punch configured
@@ -157,18 +156,28 @@ function markAsDone(id) {
 
   const normalizedId = normalizeNumber(extractNumberFromId(id));
   
+  let found = false;
   for (const key in currentSessionState.participants) {
     if (normalizeNumber(extractNumberFromId(key)) === normalizedId) {
       if (currentSessionState.participants[key].done) {
         return false; // Already done
       }
       currentSessionState.participants[key].done = true;
-      saveState(currentSessionState);
-      return true; // Successfully marked
+      found = true;
+      break;
     }
   }
   
-  return false;
+  if (!found) {
+    // Dynamically add user if they joined the group after bot startup
+    currentSessionState.participants[id] = {
+      done: true,
+      name: participantNames[id] || extractNumberFromId(id)
+    };
+  }
+  
+  saveState(currentSessionState);
+  return true;
 }
 
 function getPendingParticipants() {
@@ -468,6 +477,13 @@ function markAutoPunchUsersAsDone(statusData) {
 function readPunchStatus() {
   try {
     if (fs.existsSync(CONFIG.PUNCH_STATUS_FILE)) {
+      const stats = fs.statSync(CONFIG.PUNCH_STATUS_FILE);
+      const mtime = new Date(stats.mtime);
+      const now = new Date();
+      if (now - mtime > 12 * 60 * 60 * 1000) {
+        console.log('⚠️ Punch status file is stale, ignoring');
+        return null;
+      }
       const data = JSON.parse(fs.readFileSync(CONFIG.PUNCH_STATUS_FILE, 'utf-8'));
       return data;
     }
@@ -625,9 +641,9 @@ async function findAndCacheGroup() {
 
     const savedState = loadState();
     if (savedState) {
-      const stateDate = new Date(savedState.createdAt);
-      const today = new Date();
-      const isToday = stateDate.toDateString() === today.toDateString();
+      const stateDateStr = new Date(savedState.createdAt).toLocaleString('en-US', { timeZone: CONFIG.TIMEZONE }).split(',')[0];
+      const todayStr = new Date().toLocaleString('en-US', { timeZone: CONFIG.TIMEZONE }).split(',')[0];
+      const isToday = stateDateStr === todayStr;
 
       if (isToday) {
         currentSessionState = savedState;
@@ -654,13 +670,11 @@ async function findAndCacheGroup() {
 
 function setupMessageListener() {
   // Bug 2 Fix: only register the listener once per client lifetime.
-  // findAndCacheGroup() is called on every reconnect; without this guard
-  // each reconnect stacks another listener → messages processed N× times.
-  if (messageListenerRegistered) {
-    console.log('✓ Message listener already registered, skipping');
+  if (client._messageListenerRegistered) {
+    console.log('✓ Message listener already registered for this client, skipping');
     return;
   }
-  messageListenerRegistered = true;
+  client._messageListenerRegistered = true;
 
   client.on('message', async (msg) => {
     try {
@@ -933,9 +947,6 @@ async function connectToWhatsApp() {
   client.on('disconnected', (reason) => {
     console.log('\n❌ Disconnected:', reason);
     connectionAttempts = 0; // reset so reconnect gets a fresh slate
-    // Bug 2 Fix: reset the listener flag so the new client instance
-    // registers a fresh listener instead of being skipped
-    messageListenerRegistered = false;
     participantNames = {}; // clear stale names; will be re-fetched on next ready
     console.log('⏳ Reconnecting in 5 seconds...\n');
     setTimeout(() => connectToWhatsApp(), 5000);
