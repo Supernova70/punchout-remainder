@@ -1,7 +1,7 @@
 {
   "name": "whatsapp-punch-reminder-bot",
   "version": "1.0.0",
-  "description": "WhatsApp group reminder bot for punch in/out tracking using Baileys",
+  "description": "WhatsApp group reminder bot for punch in/out tracking (whatsapp-web.js)",
   "main": "bot.js",
   "type": "commonjs",
   "scripts": {

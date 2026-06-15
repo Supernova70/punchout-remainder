@@ -6,3 +6,4 @@ punch_data.json
 *.log
 .env
 .env.local
+*.zip

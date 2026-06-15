@@ -41,6 +41,8 @@ let groupId = null;
 let botJid = null; // Bug 1 Fix: bot's own JID to exclude from participants
 let groupParticipants = [];
 let participantNames = {}; // JID → display name (fetched from WA contact info)
+let participantNumbers = {}; // JID → normalized phone number (Contact.number, reliable even for @lid)
+let numberToJid = {};       // normalized phone number → JID (reverse lookup for !done)
 let autoPunchUsers = []; // Users with auto-punch configured
 let manualUsers = []; // Users who need to punch manually
 let currentSessionState = null;
@@ -135,7 +137,10 @@ function initializeSessionState(sessionType) {
     participants[id] = {
       done: false,
       // Use the human-readable display name fetched at startup; fall back to number
-      name: participantNames[id] || extractNumberFromId(id),
+      name: participantNames[id] || participantNumbers[id] || extractNumberFromId(id),
+      // Real phone number from Contact.number — used to match !done senders
+      // regardless of whether their JID is @c.us or @lid format.
+      number: participantNumbers[id] || normalizeNumber(extractNumberFromId(id)),
     };
   });
 
@@ -151,33 +156,66 @@ function initializeSessionState(sessionType) {
   return state;
 }
 
-function markAsDone(id) {
-  if (!currentSessionState) return false;
+// Resolve a sender JID (which can be @c.us, @lid, or carry a device suffix)
+// to the participant's real phone number. Falls back to Contact.number lookup
+// if the JID isn't in our cached map (e.g. user joined after startup).
+async function resolveSenderNumber(senderId) {
+  // Fast path: JID already cached during findAndCacheGroup()
+  if (participantNumbers[senderId]) return participantNumbers[senderId];
 
-  const normalizedId = normalizeNumber(extractNumberFromId(id));
-  
-  let found = false;
+  // Slow path: ask WhatsApp for the contact behind this JID and use Contact.number
+  try {
+    const contact = await client.getContactById(senderId);
+    if (contact && contact.number) {
+      const num = normalizeNumber(contact.number);
+      // Cache for next time so we don't re-hit the IPC
+      participantNumbers[senderId] = num;
+      numberToJid[num] = senderId;
+      return num;
+    }
+  } catch (err) {
+    console.warn(`⚠️ resolveSenderNumber failed for ${senderId}: ${err.message}`);
+  }
+
+  // Last-resort fallback: digits inside the JID itself
+  return normalizeNumber(extractNumberFromId(senderId));
+}
+
+// Returns:
+//   'marked'      → newly marked done
+//   'already'     → was already done (so caller can ack with 👌 instead of ✅)
+//   'not_in_session' → no current session
+async function markAsDone(senderId) {
+  if (!currentSessionState) return 'not_in_session';
+
+  const number = await resolveSenderNumber(senderId);
+
+  // Look for an existing participant entry whose phone number matches.
+  // Session state is keyed by JID, but each entry stores its number for lookup.
+  let matchKey = null;
   for (const key in currentSessionState.participants) {
-    if (normalizeNumber(extractNumberFromId(key)) === normalizedId) {
-      if (currentSessionState.participants[key].done) {
-        return false; // Already done
-      }
-      currentSessionState.participants[key].done = true;
-      found = true;
+    if (currentSessionState.participants[key].number === number) {
+      matchKey = key;
       break;
     }
   }
-  
-  if (!found) {
-    // Dynamically add user if they joined the group after bot startup
-    currentSessionState.participants[id] = {
-      done: true,
-      name: participantNames[id] || extractNumberFromId(id)
-    };
+
+  if (matchKey) {
+    if (currentSessionState.participants[matchKey].done) return 'already';
+    currentSessionState.participants[matchKey].done = true;
+    saveState(currentSessionState);
+    return 'marked';
   }
-  
+
+  // User wasn't in the cached group when the session started (joined later).
+  // Add them under their current JID so they're remembered for this session.
+  currentSessionState.participants[senderId] = {
+    done: true,
+    number,
+    name: participantNames[senderId] || number,
+  };
   saveState(currentSessionState);
-  return true;
+  return 'marked';
 }
 
 function getPendingParticipants() {
@@ -209,17 +247,25 @@ function normalizeNumber(num) {
 // ============================================
 
 function loadAutoPunchUsers() {
+  autoPunchUsers = [];
   try {
-    if (fs.existsSync(CONFIG.PUNCH_CONFIG_FILE)) {
-      const config = JSON.parse(fs.readFileSync(CONFIG.PUNCH_CONFIG_FILE, 'utf-8'));
-      // Problem 6 Fix: normalize whatsapp numbers by stripping non-digit chars
-      autoPunchUsers = (config.users || []).map(u => ({
-        name: u.name,
-        whatsapp: normalizeNumber(u.whatsapp),
-      }));
-      console.log(`✓ Loaded ${autoPunchUsers.length} auto-punch users from config:`);
-      autoPunchUsers.forEach(u => console.log(`  • ${u.name} (${u.whatsapp})`));
+    if (!fs.existsSync(CONFIG.PUNCH_CONFIG_FILE)) {
+      console.warn(`⚠️ Auto-punch config not found at ${CONFIG.PUNCH_CONFIG_FILE}`);
+      console.warn('   Every group member will be treated as a manual user.');
+      return;
     }
+    const config = JSON.parse(fs.readFileSync(CONFIG.PUNCH_CONFIG_FILE, 'utf-8'));
+    autoPunchUsers = (config.users || []).map(u => ({
+      name: u.name,
+      whatsapp: normalizeNumber(u.whatsapp),
+    }));
+    if (autoPunchUsers.length === 0) {
+      console.warn('⚠️ Auto-punch config loaded but contains no users.');
+      console.warn('   Every group member will be treated as a manual user.');
+      return;
+    }
+    console.log(`✓ Loaded ${autoPunchUsers.length} auto-punch users from config:`);
+    autoPunchUsers.forEach(u => console.log(`  • ${u.name} (${u.whatsapp})`));
   } catch (err) {
     console.error('Error loading punch config:', err.message);
   }
@@ -455,9 +501,10 @@ function markAutoPunchUsersAsDone(statusData) {
     if (!result.whatsapp) continue;
 
     const normalizedWa = normalizeNumber(result.whatsapp);
-    // Find the participant JID whose number matches the auto-punch result
+    // Match by the participant's real phone number (stored on each entry),
+    // not by digits inside the JID — JIDs may be @lid format.
     const matchingId = Object.keys(currentSessionState.participants).find(
-      id => normalizeNumber(extractNumberFromId(id)) === normalizedWa
+      id => currentSessionState.participants[id].number === normalizedWa
     );
 
     if (matchingId) {
@@ -615,17 +662,27 @@ async function findAndCacheGroup() {
       .map((p) => p.id._serialized)
       .filter((id) => !normalizedBotNumber || normalizeNumber(extractNumberFromId(id)) !== normalizedBotNumber);
 
-    // Fetch real display names for all participants so !pending shows names, not numbers.
-    // Priority: address book name → WhatsApp push name → phone number fallback.
-    console.log(`⏳ Fetching contact names for ${groupParticipants.length} participants...`);
+    // Fetch each participant's display name AND real phone number.
+    // Contact.number (from data.userid) is the reliable phone, even when the
+    // participant's JID is @lid (newer WhatsApp) where the digits in the JID
+    // are an internal ID, not the actual phone. We key all session state by
+    // this number so !done resolves correctly regardless of JID format.
+    console.log(`⏳ Fetching contact info for ${groupParticipants.length} participants...`);
     participantNames = {};
+    participantNumbers = {};
+    numberToJid = {};
     for (const id of groupParticipants) {
       try {
         const contact = await client.getContactById(id);
-        const displayName = contact.name || contact.pushname || extractNumberFromId(id);
+        const displayName = contact.name || contact.pushname || contact.number || extractNumberFromId(id);
+        const number = normalizeNumber(contact.number || extractNumberFromId(id));
         participantNames[id] = displayName;
+        participantNumbers[id] = number;
+        numberToJid[number] = id;
       } catch (_) {
         participantNames[id] = extractNumberFromId(id); // safe fallback
+        participantNumbers[id] = normalizeNumber(extractNumberFromId(id));
+        numberToJid[participantNumbers[id]] = id;
       }
     }
 
@@ -649,7 +706,7 @@ async function findAndCacheGroup() {
         currentSessionState = savedState;
         console.log(`\n✓ Loaded previous session state (${savedState.currentSession})`);
       } else {
-        console.log(`\n⚠️ Found old session state from ${stateDate.toDateString()}, discarding`);
+        console.log(`\n⚠️ Found old session state from ${stateDateStr}, discarding`);
         // Problem 5 Fix: delete the file instead of writing null
         clearState();
       }
@@ -706,21 +763,27 @@ function setupMessageListener() {
 
       // Bug 5 Fix: use else-if chain so commands are mutually exclusive
       // and intent is clear — no accidental fall-through.
-      if (command.includes('!done')) {
-        if (currentSessionState) {
-          const wasMarked = markAsDone(senderId);
-          if (wasMarked) {
-            // React in group only if they were just marked as done
-            try {
-              await msg.react('✅');
-              console.log('✓ Reacted to !done with ✅');
-            } catch (err) {
-              console.error('Error reacting to !done:', err.message);
-            }
-            console.log(`✓ ${extractNumberFromId(senderId)} marked as done for ${currentSessionState.currentSession} session`);
-          } else {
-            console.log(`  [Ignore] ${extractNumberFromId(senderId)} already marked done or not found.`);
+      // Match !done strictly (was .includes() which fired on "!doner", "i'm !done now", etc.)
+      if (command === '!done' || command.startsWith('!done ')) {
+        const result = await markAsDone(senderId);
+        if (result === 'marked') {
+          try {
+            await msg.react('✅');
+            console.log('✓ Reacted to !done with ✅');
+          } catch (err) {
+            console.error('Error reacting to !done:', err.message);
           }
+          console.log(`✓ ${extractNumberFromId(senderId)} marked as done for ${currentSessionState.currentSession} session`);
+        } else if (result === 'already') {
+          // Acknowledge so the user knows their first !done DID register —
+          // otherwise they re-type !done thinking it didn't take.
+          try {
+            await msg.react('👌');
+          } catch (err) { /* ignore */ }
+          console.log(`  [Ack] ${extractNumberFromId(senderId)} already marked done.`);
+        } else {
+          // no active session — silently ignore (don't react)
+          console.log(`  [Ignore] !done from ${extractNumberFromId(senderId)} — no active session.`);
         }
 
       } else if (command === '!ping') {
