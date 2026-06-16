@@ -857,25 +857,75 @@ function setupMessageListener() {
       // Fix: Remove device ID from sender JID (e.g., 1234:1@c.us -> 1234@c.us)
       // so it matches the participant ID format.
       const senderId = senderIdRaw.replace(/:\d+@/, '@');
+      const isLidSender = senderId.endsWith('@lid');
 
-      // Resolve the sender's real phone number via msg.getContact().
-      // CRITICAL: getContactById() on an @lid JID returns the LID token itself
-      // as contact.number (not the real phone number). msg.getContact() is the
-      // only reliable API for resolving @lid → real phone number.
+      // ── Sender resolution ──────────────────────────────────────────────────
+      // WhatsApp now uses opaque @lid JIDs in message authors. All contact
+      // API methods (getContactById, msg.getContact) return the LID token as
+      // contact.number rather than the real phone number.
+      //
+      // Resolution order (fastest to slowest / most reliable first):
+      //   1. lidToNumber cache (populated at startup or lazily on first match)
+      //   2. participantNumbers cache (works for legacy @c.us senders)
+      //   3. msg._data.notifyName — push name embedded directly in raw message
+      //      data, matched against participantNames built at startup. Zero API
+      //      calls, works regardless of JID format.
+      //   4. msg.getContact() — last resort, may return wrong number for @lid
+      // ───────────────────────────────────────────────────────────────────────
       let senderRealNumber = null;
-      try {
-        const senderContact = await msg.getContact();
-        if (senderContact && senderContact.number) {
-          senderRealNumber = normalizeNumber(senderContact.number);
-          // Opportunistically populate the cache so resolveSenderNumber benefits too.
-          if (!participantNumbers[senderId]) participantNumbers[senderId] = senderRealNumber;
-          if (!numberToJid[senderRealNumber]) numberToJid[senderRealNumber] = senderId;
+      let resolvedVia = '?';
+
+      // Layer 1: LID cache (fast, populated lazily)
+      if (isLidSender && lidToNumber[senderId]) {
+        senderRealNumber = lidToNumber[senderId];
+        resolvedVia = 'lid-cache';
+
+      // Layer 2: direct @c.us cache
+      } else if (!isLidSender && participantNumbers[senderId]) {
+        senderRealNumber = participantNumbers[senderId];
+        resolvedVia = 'phone-cache';
+
+      } else {
+        // Layer 3: notifyName matching — no API call needed.
+        // msg._data.notifyName is the sender's WhatsApp push name, embedded in
+        // every message at delivery time regardless of JID type.
+        const notifyName = msg._data?.notifyName || msg.notifyName;
+        if (notifyName) {
+          for (const [jid, name] of Object.entries(participantNames)) {
+            if (name === notifyName || name.toLowerCase() === notifyName.toLowerCase()) {
+              senderRealNumber = participantNumbers[jid];
+              resolvedVia = `name-match("${notifyName}")`;
+              // Cache so future messages from this sender are instant
+              if (isLidSender && senderRealNumber) {
+                lidToNumber[senderId] = senderRealNumber;
+              }
+              break;
+            }
+          }
         }
-      } catch (e) {
-        console.warn(`⚠️ msg.getContact() failed for ${senderId}: ${e.message}`);
+
+        // Layer 4: msg.getContact() — may return LID token as number for @lid senders
+        if (!senderRealNumber) {
+          try {
+            const senderContact = await msg.getContact();
+            if (senderContact && senderContact.number) {
+              const num = normalizeNumber(senderContact.number);
+              // Only trust if it matches a known participant (guards against LID token)
+              if (numberToJid[num]) {
+                senderRealNumber = num;
+                resolvedVia = 'getContact';
+                if (isLidSender) lidToNumber[senderId] = num;
+              } else {
+                console.warn(`  [resolve] getContact returned unrecognised number ${num} for ${senderId} — skipping`);
+              }
+            }
+          } catch (e) {
+            console.warn(`  [resolve] msg.getContact() failed: ${e.message}`);
+          }
+        }
       }
 
-      console.log(`[${senderRealNumber || extractNumberFromId(senderId)}] ${text}`);
+      console.log(`[${senderRealNumber || extractNumberFromId(senderId)}] ${text} (via ${resolvedVia})`);
 
       const command = text.trim().toLowerCase();
 
