@@ -735,6 +735,10 @@ function setupMessageListener() {
 
   client.on('message', async (msg) => {
     try {
+      // DEBUG: log every incoming message before any filtering to verify the
+      // event listener is actually firing (helps diagnose silent message loss)
+      console.log(`[RAW MSG] from=${msg.from} author=${msg.author} body=${msg.body}`);
+
       const chat = await msg.getChat();
 
       if (!chat.isGroup || chat.id._serialized !== groupId) return;
