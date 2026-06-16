@@ -43,6 +43,7 @@ let groupParticipants = [];
 let participantNames = {}; // JID → display name (fetched from WA contact info)
 let participantNumbers = {}; // JID → normalized phone number (Contact.number, reliable even for @lid)
 let numberToJid = {};       // normalized phone number → JID (reverse lookup for !done)
+let lidToNumber = {};       // @lid JID → real phone number (built at startup from group.participants)
 let autoPunchUsers = []; // Users with auto-punch configured
 let manualUsers = []; // Users who need to punch manually
 let currentSessionState = null;
@@ -160,33 +161,46 @@ function initializeSessionState(sessionType) {
 // to the participant's real phone number.
 //
 // IMPORTANT: @lid JIDs (e.g. "258750338314249@lid") contain an opaque LID
-// token — NOT a real phone number. extractNumberFromId() on an @lid JID returns
-// the LID token, which will never match a participant's phone number.
-// We must ALWAYS call getContactById() for @lid senders to get their real number.
+// token — NOT a real phone number. Both getContactById(@lid) and
+// msg.getContact() incorrectly return the LID token as contact.number.
+//
+// The ONLY reliable source is the lidToNumber map built at startup from
+// group.participants, where each participant has both .id (@c.us) and .lid.
 async function resolveSenderNumber(senderId) {
   const isLid = senderId.endsWith('@lid');
 
-  // Fast path: JID already cached during findAndCacheGroup() — but ONLY safe
-  // for @c.us JIDs. For @lid we must always resolve via getContactById because
-  // the cache is keyed by @c.us JID and won't have an @lid entry.
+  // Primary path for @lid senders: use the pre-built startup map.
+  // This is the only API-independent way to get the real phone number.
+  if (isLid) {
+    if (lidToNumber[senderId]) {
+      return lidToNumber[senderId];
+    }
+    // LID not in map (user joined after startup) — fall through to contact lookup
+    // but warn so we know this path was taken.
+    console.warn(`⚠️ @lid sender ${senderId} not in lidToNumber map, trying contact API...`);
+  }
+
+  // Fast path: @c.us JID already cached during findAndCacheGroup()
   if (!isLid && participantNumbers[senderId]) return participantNumbers[senderId];
 
-  // For @lid senders (or cache misses): ask WhatsApp for the real phone number.
+  // Slow path: try getContactById (works reliably for @c.us, may fail for @lid)
   try {
     const contact = await client.getContactById(senderId);
     if (contact && contact.number) {
       const num = normalizeNumber(contact.number);
-      // Cache so subsequent calls are cheap.
-      participantNumbers[senderId] = num;
-      if (!numberToJid[num]) numberToJid[num] = senderId;
-      return num;
+      // Only trust the result if it looks like a real phone number (7+ digits)
+      // to avoid caching the LID token itself as the number.
+      if (num.length >= 7) {
+        participantNumbers[senderId] = num;
+        if (!numberToJid[num]) numberToJid[num] = senderId;
+        return num;
+      }
     }
   } catch (err) {
     console.warn(`⚠️ resolveSenderNumber failed for ${senderId}: ${err.message}`);
   }
 
-  // Last-resort: digits from the JID (safe for @c.us, meaningless for @lid
-  // but better than crashing).
+  // Last-resort: digits from the JID (safe for @c.us, meaningless for @lid).
   return normalizeNumber(extractNumberFromId(senderId));
 }
 
@@ -687,6 +701,31 @@ async function findAndCacheGroup() {
     groupId = targetGroup.id._serialized;
     console.log(`✓ Found group: "${CONFIG.GROUP_NAME}"`);
     console.log(`  Group ID: ${groupId}\n`);
+
+    // Build LID → real phone number map from group participant data.
+    // In whatsapp-web.js 1.26+, each GroupParticipant has both:
+    //   .id  → their @c.us JID (real phone number in the user portion)
+    //   .lid → their @lid JID (opaque LID token — NOT a phone number)
+    // This is the ONLY reliable way to map @lid message authors to real numbers
+    // because both getContactById(@lid) and msg.getContact() incorrectly return
+    // the LID token as contact.number.
+    lidToNumber = {};
+    let lidMappings = 0;
+    for (const p of targetGroup.participants) {
+      if (p.lid && p.lid._serialized) {
+        const realNum = normalizeNumber(extractNumberFromId(p.id._serialized));
+        lidToNumber[p.lid._serialized] = realNum;
+        lidMappings++;
+      }
+    }
+    console.log(`✓ Built LID map: ${lidMappings} LID → phone number mappings`);
+    if (lidMappings === 0) {
+      console.log('  (No LID data on participants — older WA Web version or not yet migrated)');
+    } else {
+      Object.entries(lidToNumber).forEach(([lid, num]) =>
+        console.log(`  ${lid} → ${num}`)
+      );
+    }
 
     const normalizedBotNumber = botJid ? normalizeNumber(extractNumberFromId(botJid)) : null;
     groupParticipants = targetGroup.participants
