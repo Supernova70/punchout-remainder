@@ -157,41 +157,52 @@ function initializeSessionState(sessionType) {
 }
 
 // Resolve a sender JID (which can be @c.us, @lid, or carry a device suffix)
-// to the participant's real phone number. Falls back to Contact.number lookup
-// if the JID isn't in our cached map (e.g. user joined after startup).
+// to the participant's real phone number.
+//
+// IMPORTANT: @lid JIDs (e.g. "258750338314249@lid") contain an opaque LID
+// token — NOT a real phone number. extractNumberFromId() on an @lid JID returns
+// the LID token, which will never match a participant's phone number.
+// We must ALWAYS call getContactById() for @lid senders to get their real number.
 async function resolveSenderNumber(senderId) {
-  // Fast path: JID already cached during findAndCacheGroup()
-  if (participantNumbers[senderId]) return participantNumbers[senderId];
+  const isLid = senderId.endsWith('@lid');
 
-  // Slow path: ask WhatsApp for the contact behind this JID and use Contact.number
+  // Fast path: JID already cached during findAndCacheGroup() — but ONLY safe
+  // for @c.us JIDs. For @lid we must always resolve via getContactById because
+  // the cache is keyed by @c.us JID and won't have an @lid entry.
+  if (!isLid && participantNumbers[senderId]) return participantNumbers[senderId];
+
+  // For @lid senders (or cache misses): ask WhatsApp for the real phone number.
   try {
     const contact = await client.getContactById(senderId);
     if (contact && contact.number) {
       const num = normalizeNumber(contact.number);
-      // Cache for next time so we don't re-hit the IPC
+      // Cache so subsequent calls are cheap.
       participantNumbers[senderId] = num;
-      numberToJid[num] = senderId;
+      if (!numberToJid[num]) numberToJid[num] = senderId;
       return num;
     }
   } catch (err) {
     console.warn(`⚠️ resolveSenderNumber failed for ${senderId}: ${err.message}`);
   }
 
-  // Last-resort fallback: digits inside the JID itself
+  // Last-resort: digits from the JID (safe for @c.us, meaningless for @lid
+  // but better than crashing).
   return normalizeNumber(extractNumberFromId(senderId));
 }
 
 // Returns:
-//   'marked'      → newly marked done
-//   'already'     → was already done (so caller can ack with 👌 instead of ✅)
+//   'marked'         → newly marked done
+//   'already'        → was already done (ack with 👌 instead of ✅)
 //   'not_in_session' → no current session
 async function markAsDone(senderId) {
   if (!currentSessionState) return 'not_in_session';
 
   const number = await resolveSenderNumber(senderId);
+  console.log(`  [markAsDone] sender=${senderId} resolved number=${number}`);
 
-  // Look for an existing participant entry whose phone number matches.
-  // Session state is keyed by JID, but each entry stores its number for lookup.
+  // Search ALL participant entries by their stored phone number.
+  // This works regardless of whether the session was keyed by @c.us or @lid JID,
+  // because every entry stores the real phone number in .number at init time.
   let matchKey = null;
   for (const key in currentSessionState.participants) {
     if (currentSessionState.participants[key].number === number) {
@@ -201,14 +212,28 @@ async function markAsDone(senderId) {
   }
 
   if (matchKey) {
-    if (currentSessionState.participants[matchKey].done) return 'already';
+    if (currentSessionState.participants[matchKey].done) {
+      console.log(`  [markAsDone] ${number} already done (key=${matchKey})`);
+      return 'already';
+    }
     currentSessionState.participants[matchKey].done = true;
     saveState(currentSessionState);
+    console.log(`  [markAsDone] ✓ marked ${number} done (key=${matchKey})`);
     return 'marked';
   }
 
-  // User wasn't in the cached group when the session started (joined later).
-  // Add them under their current JID so they're remembered for this session.
+  // Number not in session — user joined the group after the session started.
+  // Guard: make sure we don't add a duplicate entry if somehow their number
+  // already exists under a different key (shouldn't happen, but be safe).
+  const alreadyExists = Object.values(currentSessionState.participants)
+    .some(p => p.number === number);
+  if (alreadyExists) {
+    console.log(`  [markAsDone] ${number} found as already-done via duplicate-guard`);
+    return 'already';
+  }
+
+  // Genuinely new participant (joined after session started) — add & mark done.
+  console.log(`  [markAsDone] ${number} not in session, adding as new entry`);
   currentSessionState.participants[senderId] = {
     done: true,
     number,
