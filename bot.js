@@ -194,10 +194,16 @@ async function resolveSenderNumber(senderId) {
 //   'marked'         → newly marked done
 //   'already'        → was already done (ack with 👌 instead of ✅)
 //   'not_in_session' → no current session
-async function markAsDone(senderId) {
+//
+// preResolvedNumber: pass the real phone number already resolved via
+// msg.getContact() so we don't have to call getContactById() here
+// (getContactById on an @lid JID incorrectly returns the LID token as number).
+async function markAsDone(senderId, preResolvedNumber = null) {
   if (!currentSessionState) return 'not_in_session';
 
-  const number = await resolveSenderNumber(senderId);
+  // Prefer the pre-resolved number from msg.getContact() (accurate for @lid).
+  // Fall back to our own resolver only if nothing was passed in.
+  const number = preResolvedNumber || await resolveSenderNumber(senderId);
   console.log(`  [markAsDone] sender=${senderId} resolved number=${number}`);
 
   // Search ALL participant entries by their stored phone number.
@@ -223,8 +229,8 @@ async function markAsDone(senderId) {
   }
 
   // Number not in session — user joined the group after the session started.
-  // Guard: make sure we don't add a duplicate entry if somehow their number
-  // already exists under a different key (shouldn't happen, but be safe).
+  // Guard: prevent adding a duplicate entry if number already exists under
+  // a different key (e.g. a phantom @lid entry from a previous failed lookup).
   const alreadyExists = Object.values(currentSessionState.participants)
     .some(p => p.number === number);
   if (alreadyExists) {
@@ -781,12 +787,29 @@ function setupMessageListener() {
         console.warn('⚠️ Could not determine senderId (msg.author missing), skipping command');
         return;
       }
-      
+
       // Fix: Remove device ID from sender JID (e.g., 1234:1@c.us -> 1234@c.us)
-      // so it matches the participant ID format
+      // so it matches the participant ID format.
       const senderId = senderIdRaw.replace(/:\d+@/, '@');
 
-      console.log(`[${extractNumberFromId(senderId)}] ${text}`);
+      // Resolve the sender's real phone number via msg.getContact().
+      // CRITICAL: getContactById() on an @lid JID returns the LID token itself
+      // as contact.number (not the real phone number). msg.getContact() is the
+      // only reliable API for resolving @lid → real phone number.
+      let senderRealNumber = null;
+      try {
+        const senderContact = await msg.getContact();
+        if (senderContact && senderContact.number) {
+          senderRealNumber = normalizeNumber(senderContact.number);
+          // Opportunistically populate the cache so resolveSenderNumber benefits too.
+          if (!participantNumbers[senderId]) participantNumbers[senderId] = senderRealNumber;
+          if (!numberToJid[senderRealNumber]) numberToJid[senderRealNumber] = senderId;
+        }
+      } catch (e) {
+        console.warn(`⚠️ msg.getContact() failed for ${senderId}: ${e.message}`);
+      }
+
+      console.log(`[${senderRealNumber || extractNumberFromId(senderId)}] ${text}`);
 
       const command = text.trim().toLowerCase();
 
@@ -794,7 +817,7 @@ function setupMessageListener() {
       // and intent is clear — no accidental fall-through.
       // Match !done strictly (was .includes() which fired on "!doner", "i'm !done now", etc.)
       if (command === '!done' || command.startsWith('!done ')) {
-        const result = await markAsDone(senderId);
+        const result = await markAsDone(senderId, senderRealNumber);
         if (result === 'marked') {
           try {
             await msg.react('✅');
