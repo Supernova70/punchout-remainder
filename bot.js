@@ -39,6 +39,7 @@ const CONFIG = {
 let client = null;
 let groupId = null;
 let botJid = null; // Bug 1 Fix: bot's own JID to exclude from participants
+let botIsReady = false; // true once 'ready' fires; prevents loading_screen from killing a live session
 let groupParticipants = [];
 let participantNames = {}; // JID → display name (fetched from WA contact info)
 let participantNumbers = {}; // JID → normalized phone number (Contact.number, reliable even for @lid)
@@ -890,6 +891,7 @@ function setupMessageListener() {
         // msg._data.notifyName is the sender's WhatsApp push name, embedded in
         // every message at delivery time regardless of JID type.
         const notifyName = msg._data?.notifyName || msg.notifyName;
+        console.log(`  [resolve] notifyName=${JSON.stringify(notifyName)} participantNames=${JSON.stringify(Object.values(participantNames))}`);
         if (notifyName) {
           for (const [jid, name] of Object.entries(participantNames)) {
             if (name === notifyName || name.toLowerCase() === notifyName.toLowerCase()) {
@@ -1037,6 +1039,27 @@ function setupMessageListener() {
         // Fix: use senderId (msg.author) directly — avoids 'No LID for user' crash.
         await client.sendMessage(senderId, statusMsg);
         console.log(`✓ !status report sent as DM to ${extractNumberFromId(senderId)}`);
+
+      } else if (command === '!reinit' || command.startsWith('!reinit ')) {
+        // Emergency admin command: manually initialize a session when the bot
+        // loses currentSessionState (e.g. after a spurious restart mid-session).
+        // Usage: !reinit evening  OR  !reinit morning
+        const parts = text.trim().split(/\s+/);
+        const sessionType = parts[1]?.toLowerCase();
+        if (sessionType !== 'morning' && sessionType !== 'evening') {
+          await client.sendMessage(senderId, '⚠️ Usage: !reinit morning  OR  !reinit evening');
+        } else if (!groupParticipants.length) {
+          await client.sendMessage(senderId, '❌ Cannot reinit: group not yet cached. Wait for bot to finish loading.');
+        } else {
+          initializeSessionState(sessionType);
+          await msg.react('🔄');
+          await client.sendMessage(senderId,
+            `✅ Session re-initialized as *${sessionType}*.\n` +
+            `Participants reset to pending: ${groupParticipants.length}\n` +
+            `Use !pending to verify.`
+          );
+          console.log(`✓ !reinit: session manually initialized as ${sessionType} by ${extractNumberFromId(senderId)}`);
+        }
       }
 
     } catch (err) {
@@ -1138,6 +1161,15 @@ async function connectToWhatsApp() {
   });
 
   client.on('loading_screen', (percent, message) => {
+    // CRITICAL: Once the bot is fully ready (botIsReady=true), ignore all
+    // loading_screen events. WhatsApp Web fires loading_screen AFTER the ready
+    // event in many sessions — this is benign and does NOT mean the bot is
+    // stuck. Restarting in response would kill a live, healthy session.
+    if (botIsReady) {
+      console.log(`[loading_screen ignored — bot already ready] ${percent}% - ${message}`);
+      return;
+    }
+
     console.log(`⏳ Loading Screen: ${percent}% - ${message}`);
 
     if (percent === lastLoadingPercent) {
@@ -1164,6 +1196,7 @@ async function connectToWhatsApp() {
   });
 
   client.on('ready', async () => {
+    botIsReady = true;  // ← Must be set FIRST to block spurious loading_screen events
     if (loadingTimeout) clearTimeout(loadingTimeout);
     loadingStuckSince = null;
     lastLoadingPercent = 0;
@@ -1176,6 +1209,7 @@ async function connectToWhatsApp() {
   });
 
   client.on('disconnected', (reason) => {
+    botIsReady = false;  // ← Allow loading_screen handler to arm restart timer again
     console.log('\n❌ Disconnected:', reason);
     connectionAttempts = 0; // reset so reconnect gets a fresh slate
     participantNames = {}; // clear stale names; will be re-fetched on next ready
