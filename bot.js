@@ -702,45 +702,18 @@ async function findAndCacheGroup() {
     console.log(`✓ Found group: "${CONFIG.GROUP_NAME}"`);
     console.log(`  Group ID: ${groupId}\n`);
 
-    // Build LID → real phone number map from group participant data.
-    // In whatsapp-web.js 1.26+, each GroupParticipant has both:
-    //   .id  → their @c.us JID (real phone number in the user portion)
-    //   .lid → their @lid JID (opaque LID token — NOT a phone number)
-    // This is the ONLY reliable way to map @lid message authors to real numbers
-    // because both getContactById(@lid) and msg.getContact() incorrectly return
-    // the LID token as contact.number.
-    lidToNumber = {};
-    let lidMappings = 0;
-    for (const p of targetGroup.participants) {
-      if (p.lid && p.lid._serialized) {
-        const realNum = normalizeNumber(extractNumberFromId(p.id._serialized));
-        lidToNumber[p.lid._serialized] = realNum;
-        lidMappings++;
-      }
-    }
-    console.log(`✓ Built LID map: ${lidMappings} LID → phone number mappings`);
-    if (lidMappings === 0) {
-      console.log('  (No LID data on participants — older WA Web version or not yet migrated)');
-    } else {
-      Object.entries(lidToNumber).forEach(([lid, num]) =>
-        console.log(`  ${lid} → ${num}`)
-      );
-    }
-
     const normalizedBotNumber = botJid ? normalizeNumber(extractNumberFromId(botJid)) : null;
     groupParticipants = targetGroup.participants
       .map((p) => p.id._serialized)
       .filter((id) => !normalizedBotNumber || normalizeNumber(extractNumberFromId(id)) !== normalizedBotNumber);
 
     // Fetch each participant's display name AND real phone number.
-    // Contact.number (from data.userid) is the reliable phone, even when the
-    // participant's JID is @lid (newer WhatsApp) where the digits in the JID
-    // are an internal ID, not the actual phone. We key all session state by
-    // this number so !done resolves correctly regardless of JID format.
+    // Also attempt to extract LID from contact._data.lid (Strategy 1).
     console.log(`⏳ Fetching contact info for ${groupParticipants.length} participants...`);
     participantNames = {};
     participantNumbers = {};
     numberToJid = {};
+    lidToNumber = {};
     for (const id of groupParticipants) {
       try {
         const contact = await client.getContactById(id);
@@ -749,11 +722,65 @@ async function findAndCacheGroup() {
         participantNames[id] = displayName;
         participantNumbers[id] = number;
         numberToJid[number] = id;
+
+        // Strategy 1: extract LID from raw contact data if available
+        const lidJid = contact._data?.lid?._serialized;
+        if (lidJid) {
+          lidToNumber[lidJid] = number;
+        }
       } catch (_) {
         participantNames[id] = extractNumberFromId(id); // safe fallback
         participantNumbers[id] = normalizeNumber(extractNumberFromId(id));
         numberToJid[participantNumbers[id]] = id;
       }
+    }
+
+    // Strategy 2: check raw GroupParticipant._data.lid (different from contact.lid)
+    for (const p of targetGroup.participants) {
+      const rawLid = p._data?.lid?._serialized || p.lid?._serialized;
+      if (rawLid && !lidToNumber[rawLid]) {
+        const realNum = normalizeNumber(extractNumberFromId(p.id._serialized));
+        if (realNum) lidToNumber[rawLid] = realNum;
+      }
+    }
+
+    // Strategy 3: Puppeteer — query WhatsApp Web's internal Store.Contact
+    // which always has the LID↔phone mapping regardless of whatsapp-web.js version.
+    if (Object.keys(lidToNumber).length === 0) {
+      console.log('  (Strategies 1 & 2 found no LIDs — trying Puppeteer Store.Contact...)');
+      try {
+        const groupNumbers = new Set(Object.values(participantNumbers));
+        const puppeteerLids = await client.pupPage.evaluate(() => {
+          const result = {};
+          try {
+            // WA Web exposes its contact store at window.Store.Contact
+            const contacts = window.Store.Contact.getModelsArray();
+            for (const c of contacts) {
+              // Each contact has .id (c.us JID) and .lid (lid JID) when migrated
+              if (c.lid && c.lid._serialized && c.id && c.id.user) {
+                result[c.lid._serialized] = c.id.user;
+              }
+            }
+          } catch (e) { /* Store not available */ }
+          return result;
+        });
+        for (const [lid, phoneUser] of Object.entries(puppeteerLids)) {
+          const normalized = normalizeNumber(phoneUser);
+          if (groupNumbers.has(normalized)) {
+            lidToNumber[lid] = normalized;
+          }
+        }
+      } catch (e) {
+        console.warn(`  ⚠️ Puppeteer LID lookup failed: ${e.message}`);
+      }
+    }
+
+    const lidCount = Object.keys(lidToNumber).length;
+    console.log(`✓ Built LID map: ${lidCount} LID → phone number mappings`);
+    if (lidCount > 0) {
+      Object.entries(lidToNumber).forEach(([lid, num]) => console.log(`  ${lid} → ${num}`));
+    } else {
+      console.log('  ⚠️ No LID mappings found — @lid senders will fall back to contact API');
     }
 
     console.log(`✓ Cached ${groupParticipants.length} participants:`);
