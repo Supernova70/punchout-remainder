@@ -132,17 +132,28 @@ function clearState() {
 }
 
 function initializeSessionState(sessionType) {
+  // Build a set of auto-punch phone numbers for fast O(1) lookup
+  const autoPunchNumberSet = new Set(autoPunchUsers.map(u => u.whatsapp));
+
   const participants = {};
   groupParticipants.forEach((id) => {
     // Bug 1 Fix: skip the bot's own JID so it never appears in the pending list
     if (botJid && id === botJid) return;
+
+    const number = participantNumbers[id] || normalizeNumber(extractNumberFromId(id));
+    const isAutoPunch = autoPunchNumberSet.has(number);
+
     participants[id] = {
-      done: false,
+      // Auto-punch users are ALWAYS handled by automation — pre-mark as done
+      // unconditionally so they never appear in pending lists or follow-up tags,
+      // regardless of whether the status file is available at cron time.
+      done: isAutoPunch,
+      isAutoPunch,
       // Use the human-readable display name fetched at startup; fall back to number
-      name: participantNames[id] || participantNumbers[id] || extractNumberFromId(id),
+      name: participantNames[id] || number,
       // Real phone number from Contact.number — used to match !done senders
       // regardless of whether their JID is @c.us or @lid format.
-      number: participantNumbers[id] || normalizeNumber(extractNumberFromId(id)),
+      number,
     };
   });
 
@@ -155,6 +166,11 @@ function initializeSessionState(sessionType) {
 
   currentSessionState = state;
   saveState(state);
+  console.log(`  [session] initialized '${sessionType}': ${
+    Object.values(participants).filter(p => !p.isAutoPunch).length
+  } manual users pending, ${
+    Object.values(participants).filter(p => p.isAutoPunch).length
+  } auto-punch users pre-marked done`);
   return state;
 }
 
@@ -267,7 +283,7 @@ async function markAsDone(senderId, preResolvedNumber = null) {
 function getPendingParticipants() {
   if (!currentSessionState) return [];
   return Object.entries(currentSessionState.participants)
-    .filter(([id, info]) => !info.done)
+    .filter(([id, info]) => !info.done && !info.isAutoPunch)
     .map(([id, info]) => ({ id, ...info }));
 }
 
