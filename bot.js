@@ -288,7 +288,10 @@ async function markAsDone(senderId, preResolvedNumber = null) {
 function getPendingParticipants() {
   if (!currentSessionState) return [];
   return Object.entries(currentSessionState.participants)
-    .filter(([id, info]) => !info.done && !info.isAutoPunch && !info.isIgnored)
+    // Triple guard: check done flag, isAutoPunch flag, AND live ignoredNumbers set.
+    // The live set check catches cases where state was loaded before ignore.json
+    // was read, or where the flag wasn't set on a pre-existing saved entry.
+    .filter(([id, info]) => !info.done && !info.isAutoPunch && !info.isIgnored && !ignoredNumbers.has(info.number))
     .map(([id, info]) => ({ id, ...info }));
 }
 
@@ -859,6 +862,29 @@ async function findAndCacheGroup() {
 
       if (isToday) {
         currentSessionState = savedState;
+
+        // Re-apply ignore/auto-punch flags to the loaded state.
+        // The state may have been saved BEFORE ignore.json or config.json was
+        // edited, so the flags could be stale. Re-applying here ensures that:
+        //   - Newly ignored members are immediately excluded without needing
+        //     to delete punch_data.json.
+        //   - Newly un-ignored members immediately become pending again.
+        const autoPunchNumberSet = new Set(autoPunchUsers.map(u => u.whatsapp));
+        let flagsUpdated = 0;
+        for (const [id, p] of Object.entries(currentSessionState.participants)) {
+          const wasIgnored = !!p.isIgnored;
+          const wasAuto = !!p.isAutoPunch;
+          p.isIgnored = ignoredNumbers.has(p.number);
+          p.isAutoPunch = autoPunchNumberSet.has(p.number);
+          // Mark done if ignored or auto-punch; restore pending if no longer either
+          if ((p.isIgnored || p.isAutoPunch) && !p.done) {
+            p.done = true;
+            flagsUpdated++;
+          }
+          if (wasIgnored !== p.isIgnored || wasAuto !== p.isAutoPunch) flagsUpdated++;
+        }
+        if (flagsUpdated > 0) saveState(currentSessionState);
+
         console.log(`\n✓ Loaded previous session state (${savedState.currentSession})`);
       } else {
         console.log(`\n⚠️ Found old session state from ${stateDateStr}, discarding`);
