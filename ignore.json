@@ -1,0 +1,6 @@
+{
+  "_comment": "Phone numbers in this list will be silently excluded from all reminders and !pending output.",
+  "_comment2": "Format: full number with country code, digits only (no +, no spaces, no dashes).",
+  "_comment3": "Edit this file on the server and run: pm2 restart whatsapp-bot",
+  "numbers": []
+}

@@ -14,6 +14,8 @@ const CONFIG = {
   DATA_FILE: './punch_data.json',
   PUNCH_STATUS_FILE: '/home/ubuntu/punchin-auto/status/punch_status.json',
   PUNCH_CONFIG_FILE: '/home/ubuntu/punchin-auto/config.json',
+  // Ignore list: members who should never be tagged or shown in pending
+  IGNORE_FILE: './ignore.json',
   // Stale lock file path (Chromium leaves this behind on crash)
   WWEBJS_SESSION_DIR: '/home/ubuntu/punchout-remainder/.wwebjs_auth/session',
   // Auto punch check times (after punch_action.py runs)
@@ -46,6 +48,7 @@ let participantNumbers = {}; // JID → normalized phone number (Contact.number,
 let numberToJid = {};       // normalized phone number → JID (reverse lookup for !done)
 let lidToNumber = {};       // @lid JID → real phone number (built at startup from group.participants)
 let autoPunchUsers = []; // Users with auto-punch configured
+let ignoredNumbers = new Set(); // Numbers that should never be reminded or shown in !pending
 let manualUsers = []; // Users who need to punch manually
 let currentSessionState = null;
 let cronjobs = [];
@@ -132,7 +135,7 @@ function clearState() {
 }
 
 function initializeSessionState(sessionType) {
-  // Build a set of auto-punch phone numbers for fast O(1) lookup
+  // Build lookup sets for fast O(1) membership tests
   const autoPunchNumberSet = new Set(autoPunchUsers.map(u => u.whatsapp));
 
   const participants = {};
@@ -142,17 +145,17 @@ function initializeSessionState(sessionType) {
 
     const number = participantNumbers[id] || normalizeNumber(extractNumberFromId(id));
     const isAutoPunch = autoPunchNumberSet.has(number);
+    const isIgnored = ignoredNumbers.has(number);
 
     participants[id] = {
-      // Auto-punch users are ALWAYS handled by automation — pre-mark as done
-      // unconditionally so they never appear in pending lists or follow-up tags,
-      // regardless of whether the status file is available at cron time.
-      done: isAutoPunch,
+      // Auto-punch and ignored users are pre-marked as done so they never
+      // appear in pending lists or follow-up tags.
+      done: isAutoPunch || isIgnored,
       isAutoPunch,
+      isIgnored,
       // Use the human-readable display name fetched at startup; fall back to number
       name: participantNames[id] || number,
       // Real phone number from Contact.number — used to match !done senders
-      // regardless of whether their JID is @c.us or @lid format.
       number,
     };
   });
@@ -167,10 +170,12 @@ function initializeSessionState(sessionType) {
   currentSessionState = state;
   saveState(state);
   console.log(`  [session] initialized '${sessionType}': ${
-    Object.values(participants).filter(p => !p.isAutoPunch).length
+    Object.values(participants).filter(p => !p.isAutoPunch && !p.isIgnored).length
   } manual users pending, ${
     Object.values(participants).filter(p => p.isAutoPunch).length
-  } auto-punch users pre-marked done`);
+  } auto-punch done, ${
+    Object.values(participants).filter(p => p.isIgnored).length
+  } ignored`);
   return state;
 }
 
@@ -283,7 +288,7 @@ async function markAsDone(senderId, preResolvedNumber = null) {
 function getPendingParticipants() {
   if (!currentSessionState) return [];
   return Object.entries(currentSessionState.participants)
-    .filter(([id, info]) => !info.done && !info.isAutoPunch)
+    .filter(([id, info]) => !info.done && !info.isAutoPunch && !info.isIgnored)
     .map(([id, info]) => ({ id, ...info }));
 }
 
@@ -333,6 +338,37 @@ function loadAutoPunchUsers() {
   }
 }
 
+// ============================================
+// Load Ignored Users from ignore.json
+// ============================================
+// Format: { "numbers": ["918160615190", "917348082840"] }
+// Edit the file on the server and restart the bot to apply changes.
+// No code deployment needed.
+
+function loadIgnoredUsers() {
+  ignoredNumbers = new Set();
+  try {
+    if (!fs.existsSync(CONFIG.IGNORE_FILE)) {
+      console.log(`ℹ️  No ignore.json found at ${CONFIG.IGNORE_FILE} — no users ignored.`);
+      console.log('   Create it to silently exclude group members from reminders.');
+      return;
+    }
+    const data = JSON.parse(fs.readFileSync(CONFIG.IGNORE_FILE, 'utf-8'));
+    const numbers = data.numbers || data; // support both {"numbers":[...]} and plain array
+    if (!Array.isArray(numbers) || numbers.length === 0) {
+      console.log('ℹ️  ignore.json is empty — no users ignored.');
+      return;
+    }
+    for (const num of numbers) {
+      ignoredNumbers.add(normalizeNumber(String(num)));
+    }
+    console.log(`✅ Loaded ${ignoredNumbers.size} ignored number(s) from ignore.json:`);
+    ignoredNumbers.forEach(n => console.log(`  • ${n}`));
+  } catch (err) {
+    console.error('Error loading ignore.json:', err.message);
+  }
+}
+
 function categorizeParticipants() {
   const autoPunchNumbers = autoPunchUsers.map(u => u.whatsapp);
 
@@ -341,8 +377,10 @@ function categorizeParticipants() {
       // Problem 6 Fix: normalize WA JID number before comparing
       const normalized = normalizeNumber(extractNumberFromId(id));
       const isAuto = autoPunchNumbers.includes(normalized);
-      console.log(`  [match] ${normalized} → ${isAuto ? 'auto-punch ✅' : 'manual 🖐️'}`);
-      return !isAuto;
+      const isIgnored = ignoredNumbers.has(normalized);
+      const tag = isAuto ? 'auto-punch ✅' : isIgnored ? 'ignored 🔇' : 'manual 🖐️';
+      console.log(`  [match] ${normalized} → ${tag}`);
+      return !isAuto && !isIgnored;
     })
     .map(id => ({
       id,
@@ -351,6 +389,7 @@ function categorizeParticipants() {
 
   console.log(`\n✓ Categorized participants:`);
   console.log(`  Auto-punch: ${autoPunchUsers.length} users`);
+  console.log(`  Ignored:    ${ignoredNumbers.size} users`);
   console.log(`  Manual (need reminder): ${manualUsers.length} users`);
   manualUsers.forEach(u => console.log(`  • ${u.number}`));
 }
@@ -806,9 +845,11 @@ async function findAndCacheGroup() {
       console.log(`  • ${name} (${extractNumberFromId(id)})`);
     });
 
-    // Load auto-punch users and categorize
+    // Load auto-punch users, ignored users, then categorize
     loadAutoPunchUsers();
+    loadIgnoredUsers();
     categorizeParticipants();
+
 
     const savedState = loadState();
     if (savedState) {
