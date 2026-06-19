@@ -264,11 +264,24 @@ async function markAsDone(senderId, preResolvedNumber = null) {
     return 'marked';
   }
 
-  // Number not in session — user joined the group after the session started.
-  // Guard: prevent adding a duplicate entry if number already exists under
-  // a different key (e.g. a phantom @lid entry from a previous failed lookup).
+  // Number not in session — could be: (a) user joined after session started,
+  // or (b) sender resolution failed and 'number' is a LID token / garbage value.
+  //
+  // SAFETY GUARD: only add a new participant entry if the number looks like a
+  // real phone number (7–15 digits) AND is not already tracked under a different
+  // key. This prevents a failed @lid resolution from creating a phantom entry
+  // that marks itself done while leaving the real participant still pending.
+  const looksLikePhone = /^\d{7,15}$/.test(number);
   const alreadyExists = Object.values(currentSessionState.participants)
     .some(p => p.number === number);
+
+  if (!looksLikePhone) {
+    // number is probably an unresolved LID token (15+ digits) or null-ish —
+    // do NOT create a phantom entry; log and silently ignore.
+    console.warn(`  [markAsDone] ⚠️ could not resolve real number for ${senderId} (got '${number}') — not marking done to avoid phantom entry`);
+    return 'not_in_session';
+  }
+
   if (alreadyExists) {
     console.log(`  [markAsDone] ${number} found as already-done via duplicate-guard`);
     return 'already';
@@ -973,13 +986,29 @@ function setupMessageListener() {
         // Layer 3: notifyName matching — no API call needed.
         // msg._data.notifyName is the sender's WhatsApp push name, embedded in
         // every message at delivery time regardless of JID type.
+        //
+        // Matching strategy (in order, stops at first match):
+        //   a. Exact case-insensitive match          "Sanjay Rohan" == "Sanjay Rohan"
+        //   b. notifyName is a first-name prefix     "Sanjay Rohan".startsWith("Sanjay")
+        //   c. contact name is prefix of notifyName  "Sanjay".startsWith("Sanjay Rohan") (rare)
+        //   d. substring match (last resort)          "Sanjay Rohan".includes("Sanjay")
+        const nameMatches = (stored, push) => {
+          const s = stored.toLowerCase().trim();
+          const p = push.toLowerCase().trim();
+          return s === p ||
+            s.startsWith(p + ' ') ||
+            p.startsWith(s + ' ') ||
+            s.includes(p) ||
+            p.includes(s);
+        };
+
         const notifyName = msg._data?.notifyName || msg.notifyName;
         console.log(`  [resolve] notifyName=${JSON.stringify(notifyName)} participantNames=${JSON.stringify(Object.values(participantNames))}`);
         if (notifyName) {
           for (const [jid, name] of Object.entries(participantNames)) {
-            if (name === notifyName || name.toLowerCase() === notifyName.toLowerCase()) {
+            if (nameMatches(name, notifyName)) {
               senderRealNumber = participantNumbers[jid];
-              resolvedVia = `name-match("${notifyName}")`;
+              resolvedVia = `name-match("${notifyName}"→"${name}")`;
               // Cache so future messages from this sender are instant
               if (isLidSender && senderRealNumber) {
                 lidToNumber[senderId] = senderRealNumber;
