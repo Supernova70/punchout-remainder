@@ -920,12 +920,12 @@ async function findAndCacheGroup() {
 // ============================================
 
 function setupMessageListener() {
-  // Bug 2 Fix: only register the listener once per client lifetime.
-  if (client._messageListenerRegistered) {
-    console.log('✓ Message listener already registered for this client, skipping');
-    return;
-  }
-  client._messageListenerRegistered = true;
+  // Remove any existing 'message' listener before re-registering.
+  // This is safe because we always add exactly one listener here.
+  // Using removeAllListeners() instead of a boolean flag means that if
+  // 'ready' fires again (e.g. after a page reload triggered by TIMEOUT/CONFLICT
+  // reconnect), the listener is cleanly refreshed rather than silently skipped.
+  client.removeAllListeners('message');
 
   client.on('message', async (msg) => {
     try {
@@ -1268,8 +1268,24 @@ async function connectToWhatsApp() {
     console.error('❌ Authentication failed:', msg);
   });
 
+  // Bad states where WhatsApp Web's incoming message bridge silently dies:
+  //   TIMEOUT  — WA server lost the WebSocket but Chromium page is still alive.
+  //              Outbound sends still work (buffered CDP), receives are dead.
+  //   CONFLICT — The same WA account was opened elsewhere, invalidating this session.
+  // In both cases the 'disconnected' event never fires, so we must act here.
+  const BAD_STATES = ['TIMEOUT', 'CONFLICT', 'UNPAIRED', 'UNPAIRED_IDLE'];
   client.on('change_state', (state) => {
-    console.log('🔄 State Changed:', state);
+    console.log('🔄 WhatsApp state changed:', state);
+    if (BAD_STATES.includes(state)) {
+      console.warn(`⚠️  Bad state detected: ${state}. Triggering reconnect in 10s...`);
+      botIsReady = false;
+      // Give WA 10 s to self-recover before forcing a full reconnect
+      setTimeout(() => {
+        console.log(`🔄 Reconnecting after bad state (${state})...`);
+        client.destroy().catch(() => {});
+        setTimeout(() => connectToWhatsApp(), 5000);
+      }, 10000);
+    }
   });
 
   client.on('loading_screen', (percent, message) => {
