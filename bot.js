@@ -790,7 +790,31 @@ async function findAndCacheGroup() {
       try {
         const contact = await client.getContactById(id);
         const displayName = contact.name || contact.pushname || contact.number || extractNumberFromId(id);
-        const number = normalizeNumber(contact.number || extractNumberFromId(id));
+
+        // CRITICAL: For @lid JIDs, contact.number returns the LID token (a 15-18 digit
+        // opaque identifier), NOT a real phone number. We must validate the number
+        // looks like a real phone (7-15 digits) before trusting it.
+        // If it fails, fall through to id.user (the actual phone digits in the @c.us JID)
+        // or strip digits from the JID itself.
+        let rawNum = normalizeNumber(contact.number || '');
+        let number;
+        if (rawNum.length >= 7 && rawNum.length <= 15) {
+          // Looks like a real phone number — trust it
+          number = rawNum;
+        } else {
+          // contact.number is a LID token or empty — use the @c.us user part instead.
+          // contact.id.user contains the phone digits for @c.us contacts.
+          const idUser = contact.id?.user ? normalizeNumber(contact.id.user) : '';
+          if (idUser.length >= 7 && idUser.length <= 15) {
+            number = idUser;
+            console.log(`  ⚠️ LID number fallback for ${id}: contact.number='${contact.number}' → using contact.id.user='${idUser}'`);
+          } else {
+            // Last resort: digits from the JID itself (safe for @c.us, wrong for @lid)
+            number = normalizeNumber(extractNumberFromId(id));
+            console.log(`  ⚠️ LID number fallback for ${id}: contact.number='${contact.number}' → using JID digits='${number}'`);
+          }
+        }
+
         participantNames[id] = displayName;
         participantNumbers[id] = number;
         numberToJid[number] = id;
@@ -806,6 +830,7 @@ async function findAndCacheGroup() {
         numberToJid[participantNumbers[id]] = id;
       }
     }
+
 
     // Strategy 2: check raw GroupParticipant._data.lid (different from contact.lid)
     for (const p of targetGroup.participants) {
